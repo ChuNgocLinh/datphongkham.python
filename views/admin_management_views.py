@@ -1,0 +1,5317 @@
+import csv
+import hashlib
+import os
+import re
+import shutil
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import tempfile
+
+from PyQt6 import QtCore, QtGui, QtWidgets
+
+from controllers.settings_controller import SettingsController
+from controllers.report_controller import ReportController
+from config import DB_TYPE
+
+
+from database.view_db_helper import _safe_fetch_all, _safe_execute
+
+CAREPLUS_GREEN = "#00a651"
+TEXT_DARK = "#0f172a"
+TEXT_MUTED = "#64748b"
+PAGE_BG = "#f8fafc"
+
+
+def _ensure_column(table, column, definition):
+    if DB_TYPE == "mysql":
+        return _safe_execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    table_name = table if "." in table else f"dbo.{table}"
+    return _safe_execute(
+        f"""
+        IF COL_LENGTH('{table_name}', '{column}') IS NULL
+        BEGIN
+            ALTER TABLE {table_name} ADD {column} {definition}
+        END
+        """
+    )
+
+
+def _ensure_admin_runtime_schema():
+    try:
+        from models.user_model import UserModel
+
+        UserModel._ensure_auth_schema()
+    except Exception:
+        pass
+
+    try:
+        from models.settings_model import SettingsModel
+
+        SettingsModel.ensure_table_exists()
+    except Exception:
+        pass
+
+
+def _hash_password(password):
+    return hashlib.sha256(str(password or "").encode()).hexdigest()
+
+
+def _as_text(value, default=""):
+    if value is None:
+        return default
+    return str(value)
+
+
+def _as_float(value):
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return int(default or 0)
+
+
+def _is_active(row):
+    value = row.get("is_active", True)
+    if isinstance(value, str):
+        return value.lower() not in {"0", "false", "no", "ngung", "inactive"}
+    return bool(value)
+
+
+def _contains(row, fields, query):
+    if not query:
+        return True
+    normalized = query.lower().strip()
+    return any(normalized in _as_text(row.get(field)).lower() for field in fields)
+
+
+def _parse_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = _as_text(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(text[:19], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _format_date(value):
+    parsed = _parse_date(value)
+    if parsed:
+        return parsed.strftime("%d/%m/%Y")
+    return _as_text(value, "Chưa có")
+
+
+def _format_datetime(value):
+    if isinstance(value, datetime):
+        return value.strftime("%d/%m/%Y %H:%M")
+    text = _as_text(value).strip()
+    if not text:
+        return "Chưa có"
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt).strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            continue
+    return text
+
+
+def _age_from_dob(value):
+    dob = _parse_date(value)
+    if not dob:
+        return None
+    today = date.today()
+    return today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+
+
+def _format_money(value):
+    return f"{_as_float(value):,.0f}".replace(",", ".") + " đ"
+
+
+def _status_kind(text):
+    lowered = _as_text(text).lower()
+    if any(word in lowered for word in ("thành công", "hoạt động", "paid", "an toàn", "còn hàng")):
+        return "success"
+    if any(word in lowered for word in ("chờ", "pending", "tạm", "sắp hết", "đang")):
+        return "warning"
+    if any(word in lowered for word in ("lỗi", "thất bại", "hết hàng", "khóa", "ngừng", "nguy hiểm", "unpaid")):
+        return "danger"
+    return "neutral"
+
+
+def _status_colors(kind):
+    return {
+        "success": ("#dcfce7", "#15803d"),
+        "warning": ("#ffedd5", "#c2410c"),
+        "danger": ("#fee2e2", "#b91c1c"),
+        "info": ("#dbeafe", "#1d4ed8"),
+        "neutral": ("#f1f5f9", "#475569"),
+    }.get(kind, ("#f1f5f9", "#475569"))
+
+
+def _admin_notification_copy(item):
+    title = _as_text(item.get("title"), "Thông báo hệ thống").strip()
+    detail = _as_text(item.get("content"), "").strip()
+    normalized = f"{title} {detail}".lower()
+
+    if "tổng quan dữ liệu" in normalized or "dữ liệu mẫu bác sĩ" in normalized:
+        return (
+            "Dữ liệu hệ thống đã được đồng bộ",
+            "Dữ liệu phục vụ quản trị đã được cập nhật và sẵn sàng cho công tác theo dõi.",
+        )
+    if "lịch khám ngày mai" in normalized:
+        return "Nhắc lịch khám ngày mai", detail or "Có bệnh nhân cần được nhắc lịch khám vào ngày mai."
+    if "đơn thuốc đã hủy" in normalized or "đánh dấu hủy" in normalized:
+        return (
+            "Cập nhật trạng thái đơn thuốc",
+            detail.replace("đã được đánh dấu hủy", "đã được cập nhật sang trạng thái hủy")
+            or "Một đơn thuốc đã được cập nhật sang trạng thái hủy.",
+        )
+    if "chờ kết quả chụp" in normalized or "chẩn đoán hình ảnh" in normalized:
+        return (
+            "Theo dõi kết quả chẩn đoán hình ảnh",
+            detail or "Có bệnh nhân đang chờ kết quả chẩn đoán hình ảnh.",
+        )
+
+    title = re.sub(r"^\s*Mẫu\s+bác\s+sĩ\s+\d+\s*[-:–]\s*", "", title, flags=re.IGNORECASE).strip()
+    if title:
+        title = title[:1].upper() + title[1:]
+    return title or "Thông báo hệ thống", detail
+
+
+ROLE_LABELS = {
+    "admin": "Quản trị viên",
+    "doctor": "Bác sĩ",
+    "patient": "Khách hàng",
+    "staff": "Nhân viên",
+    "receptionist": "Lễ tân",
+    "accountant": "Kế toán",
+    "nurse": "Điều dưỡng",
+}
+
+
+ROLE_KIND = {
+    "admin": "success",
+    "doctor": "info",
+    "receptionist": "warning",
+    "accountant": "neutral",
+    "nurse": "info",
+    "staff": "neutral",
+    "patient": "warning",
+}
+
+
+ACCOUNT_ROLE_OPTIONS = [
+    ("Quản trị viên", "admin"),
+    ("Bác sĩ", "doctor"),
+    ("Lễ tân", "receptionist"),
+    ("Kế toán", "accountant"),
+    ("Điều dưỡng", "nurse"),
+    ("Nhân viên", "staff"),
+    ("Khách hàng", "patient"),
+]
+
+
+ROLE_DB_MAP = {
+    "admin": "admin",
+    "doctor": "doctor",
+    "receptionist": "staff",
+    "accountant": "staff",
+    "nurse": "staff",
+    "staff": "staff",
+    "patient": "patient",
+}
+
+
+def _db_role(role):
+    return ROLE_DB_MAP.get(_as_text(role).lower().strip(), _as_text(role).lower().strip())
+
+
+def _role_label(role):
+    key = _as_text(role).lower().strip()
+    return ROLE_LABELS.get(key, _as_text(role).title())
+
+
+def _sync_user_rbac_role(user_id, role_key, actor_user_id=None):
+    if not user_id:
+        return False
+    normalized_role = _as_text(role_key).lower().strip()
+    if not normalized_role:
+        return False
+
+    pass
+
+    _safe_execute(
+        """
+        INSERT INTO rbac_roles (role_key, display_name, description, color_kind, is_system, is_active)
+        SELECT ?, ?, ?, ?, ?, 1
+        WHERE NOT EXISTS (SELECT 1 FROM rbac_roles WHERE role_key=?)
+        """,
+        (
+            normalized_role,
+            _role_label(normalized_role),
+            _role_label(normalized_role),
+            ROLE_KIND.get(normalized_role, "neutral"),
+            1 if normalized_role in {"admin", "doctor", "staff", "patient"} else 0,
+            normalized_role,
+        ),
+    )
+    role_rows = _safe_fetch_all("SELECT role_id FROM rbac_roles WHERE role_key=?", (normalized_role,))
+    if not role_rows:
+        return False
+    role_id = role_rows[0].get("role_id")
+
+    _safe_execute("UPDATE rbac_user_role_assignments SET is_active=0 WHERE user_id=?", (user_id,))
+    existing = _safe_fetch_all(
+        "SELECT assignment_id FROM rbac_user_role_assignments WHERE user_id=? AND role_id=?",
+        (user_id, role_id),
+    )
+    if existing:
+        return _safe_execute(
+            """
+            UPDATE rbac_user_role_assignments
+            SET is_active=1, assigned_by_user_id=?, assigned_at=CURRENT_TIMESTAMP
+            WHERE user_id=? AND role_id=?
+            """,
+            (actor_user_id, user_id, role_id),
+        )
+    return _safe_execute(
+        """
+        INSERT INTO rbac_user_role_assignments (user_id, role_id, assigned_by_user_id, is_active)
+        VALUES (?, ?, ?, 1)
+        """,
+        (user_id, role_id, actor_user_id),
+    )
+
+
+class LineChartWidget(QtWidgets.QWidget):
+    def __init__(self, labels=None, values=None, color=CAREPLUS_GREEN, parent=None):
+        super().__init__(parent)
+        self.labels = labels or []
+        self.values = values or []
+        self.color = QtGui.QColor(color)
+        self.setMinimumHeight(230)
+
+    def set_data(self, labels, values):
+        self.labels = labels
+        self.values = values
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        rect = self.rect().adjusted(16, 12, -16, -12)
+        if not self.values:
+            painter.setPen(QtGui.QColor(TEXT_MUTED))
+            painter.drawText(rect, QtCore.Qt.AlignmentFlag.AlignCenter, "Chưa có dữ liệu")
+            return
+
+        left, right, top, bottom = 48, 16, 18, 32
+        chart = self.rect().adjusted(left, top, -right, -bottom)
+        max_value = max(max(self.values), 1)
+        painter.setPen(QtGui.QPen(QtGui.QColor("#edf2f7"), 1))
+        for i in range(5):
+            y = chart.top() + i * chart.height() / 4
+            painter.drawLine(chart.left(), int(y), chart.right(), int(y))
+
+        points = []
+        step = chart.width() / max(1, len(self.values) - 1)
+        for idx, value in enumerate(self.values):
+            x = chart.left() + idx * step
+            y = chart.bottom() - (float(value) / max_value * chart.height())
+            points.append(QtCore.QPointF(x, y))
+
+        area = QtGui.QPainterPath()
+        area.moveTo(points[0].x(), chart.bottom())
+        for point in points:
+            area.lineTo(point)
+        area.lineTo(points[-1].x(), chart.bottom())
+        area.closeSubpath()
+        gradient = QtGui.QLinearGradient(0, chart.top(), 0, chart.bottom())
+        gradient.setColorAt(0, QtGui.QColor(self.color.red(), self.color.green(), self.color.blue(), 90))
+        gradient.setColorAt(1, QtGui.QColor(self.color.red(), self.color.green(), self.color.blue(), 5))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawPath(area)
+
+        line = QtGui.QPainterPath()
+        line.moveTo(points[0])
+        for point in points[1:]:
+            line.lineTo(point)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.setPen(QtGui.QPen(self.color, 3))
+        painter.drawPath(line)
+        painter.setBrush(QtGui.QColor("white"))
+        for point in points:
+            painter.drawEllipse(point, 4, 4)
+
+        painter.setPen(QtGui.QColor(TEXT_MUTED))
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+        for idx, label in enumerate(self.labels):
+            x = chart.left() + idx * step - 14
+            painter.drawText(int(x), self.height() - 10, _as_text(label)[:8])
+
+
+class DonutChartWidget(QtWidgets.QWidget):
+    COLORS = ["#00a651", "#2563eb", "#f97316", "#8b5cf6", "#ef4444", "#14b8a6"]
+
+    def __init__(self, items=None, parent=None):
+        super().__init__(parent)
+        self.items = items or []
+        self.setMinimumHeight(230)
+
+    def set_items(self, items):
+        self.items = items
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if not self.items or sum(value for _, value in self.items) <= 0:
+            painter.setPen(QtGui.QColor(TEXT_MUTED))
+            painter.drawText(self.rect(), QtCore.Qt.AlignmentFlag.AlignCenter, "Chưa có dữ liệu")
+            return
+
+        total = sum(value for _, value in self.items)
+        size = min(self.height() - 48, self.width() * 0.42)
+        pie_rect = QtCore.QRectF(22, 32, size, size)
+        start = 90 * 16
+        for idx, (_, value) in enumerate(self.items):
+            span = int(round(-(value / total) * 360 * 16))
+            painter.setBrush(QtGui.QColor(self.COLORS[idx % len(self.COLORS)]))
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.drawPie(pie_rect, start, span)
+            start += span
+
+        inner = pie_rect.adjusted(size * 0.28, size * 0.28, -size * 0.28, -size * 0.28)
+        painter.setBrush(QtGui.QColor("white"))
+        painter.drawEllipse(inner)
+
+        x = int(pie_rect.right()) + 26
+        y = 34
+        painter.setFont(QtGui.QFont("Arial", 9))
+        for idx, (label, value) in enumerate(self.items):
+            color = QtGui.QColor(self.COLORS[idx % len(self.COLORS)])
+            painter.setBrush(color)
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(x, y + idx * 28, 14, 14, 3, 3)
+            painter.setPen(QtGui.QColor(TEXT_DARK))
+            percent = value / total * 100
+            painter.drawText(x + 22, y + 12 + idx * 28, f"{label}: {percent:.0f}%")
+
+
+class FormDialog(QtWidgets.QDialog):
+    def __init__(self, title, fields, data=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(460)
+        self.inputs = {}
+        data = data or {}
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        form.setFormAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(12)
+
+        for field in fields:
+            key = field["key"]
+            value = data.get(key, field.get("default", ""))
+            widget_type = field.get("type", "text")
+            if widget_type == "combo":
+                widget = QtWidgets.QComboBox()
+                for label, item_value in field.get("options", []):
+                    widget.addItem(label, item_value)
+                index = widget.findData(value)
+                if index < 0:
+                    index = widget.findText(_as_text(value))
+                widget.setCurrentIndex(max(index, 0))
+            elif widget_type == "spin":
+                widget = QtWidgets.QSpinBox()
+                widget.setRange(field.get("min", 0), field.get("max", 100000000))
+                widget.setValue(_as_int(value))
+            elif widget_type == "money":
+                widget = QtWidgets.QDoubleSpinBox()
+                widget.setRange(0, 1000000000)
+                widget.setDecimals(0)
+                widget.setSuffix(" đ")
+                widget.setValue(_as_float(value))
+            elif widget_type == "date":
+                widget = QtWidgets.QDateEdit()
+                widget.setCalendarPopup(True)
+                parsed = _parse_date(value) or date.today()
+                widget.setDate(QtCore.QDate(parsed.year, parsed.month, parsed.day))
+            elif widget_type == "password":
+                widget = QtWidgets.QLineEdit(_as_text(value))
+                widget.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            else:
+                widget = QtWidgets.QLineEdit(_as_text(value))
+            widget.setStyleSheet(self._input_style())
+            self.inputs[key] = (widget, field)
+            form.addRow(field["label"], widget)
+
+        layout.addLayout(form)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Save).setText("Lưu")
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("Hủy")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _input_style():
+        return """
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {
+                min-height: 36px;
+                padding: 6px 10px;
+                border: 1px solid #dbe3ef;
+                border-radius: 8px;
+                background: white;
+                color: #0f172a;
+                font-size: 13px;
+            }
+        """
+
+    def values(self):
+        payload = {}
+        for key, (widget, field) in self.inputs.items():
+            widget_type = field.get("type", "text")
+            if widget_type == "combo":
+                payload[key] = widget.currentData()
+            elif widget_type == "spin":
+                payload[key] = widget.value()
+            elif widget_type == "money":
+                payload[key] = widget.value()
+            elif widget_type == "date":
+                payload[key] = widget.date().toString("yyyy-MM-dd")
+            else:
+                payload[key] = widget.text().strip()
+        return payload
+
+
+class AdminBasePage(QtWidgets.QWidget):
+    page_title = "Admin"
+    breadcrumb = "Dashboard / Admin"
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(parent)
+        self.user_data = user_data or {}
+        self.content_layout = QtWidgets.QVBoxLayout(self)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(18)
+
+    def _card(self):
+        card = QtWidgets.QFrame()
+        card.setObjectName("adminCard")
+        card.setStyleSheet("""
+            QFrame#adminCard {
+                background: white;
+                border: 1px solid #e2e8f0;
+                border-radius: 16px;
+            }
+        """)
+        shadow = QtWidgets.QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(18)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QtGui.QColor(15, 23, 42, 18))
+        card.setGraphicsEffect(shadow)
+        return card
+
+    def _section_title(self, text):
+        label = QtWidgets.QLabel(text)
+        label.setStyleSheet("font-size: 17px; font-weight: 900; color: #0f172a; background: transparent;")
+        return label
+
+    def _muted(self, text):
+        label = QtWidgets.QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("font-size: 12px; font-weight: 600; color: #64748b; background: transparent;")
+        return label
+
+    def _filter_field(self, label_text, field):
+        wrapper = QtWidgets.QWidget()
+        wrapper.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        layout = QtWidgets.QVBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        label = QtWidgets.QLabel(label_text)
+        label.setStyleSheet("font-size: 11px; font-weight: 850; color: #64748b; background: transparent;")
+        layout.addWidget(label)
+        layout.addWidget(field)
+        return wrapper
+
+    def _button(self, text, primary=False, danger=False):
+        btn = QtWidgets.QPushButton(text)
+        btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        if primary:
+            style = "background: #00a651; color: white; border: 1px solid #00a651;"
+        elif danger:
+            style = "background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca;"
+        else:
+            style = "background: white; color: #0f172a; border: 1px solid #dbe3ef;"
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                {style}
+                min-height: 36px;
+                padding: 0 12px;
+                border-radius: 8px;
+                font-weight: 800;
+                font-size: 13px;
+            }}
+            QPushButton:hover {{ background: #f8fafc; }}
+            QPushButton:disabled {{ background: #e5e7eb; color: #94a3b8; border-color: #e5e7eb; }}
+        """)
+        return btn
+
+    def _icon_button(self, text, kind="info"):
+        bg, color = _status_colors({"info": "info", "danger": "danger", "success": "success"}.get(kind, "neutral"))
+        icon_text = {
+            "Xem": "◉",
+            "Sửa": "✎",
+            "Xóa": "⌫",
+            "In": "⎙",
+            "Khóa": "🔒",
+            "Mở": "🔓",
+            "Tải": "⇩",
+            "Đổi": "⋯",
+            "•••": "⋯",
+            "Hủy": "×",
+        }.get(text, text)
+        btn = QtWidgets.QPushButton(icon_text)
+        btn.setToolTip(text)
+        btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        btn.setFixedSize(30, 30)
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {bg};
+                color: {color};
+                border: none;
+                border-radius: 7px;
+                padding: 0 9px;
+                font-weight: 900;
+            }}
+        """)
+        return btn
+
+    def _badge(self, text, kind=None):
+        kind = kind or _status_kind(text)
+        bg, color = _status_colors(kind)
+        label = QtWidgets.QLabel(text)
+        label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        label.setMinimumHeight(24)
+        label.setMaximumHeight(28)
+        label.setStyleSheet(f"""
+            QLabel {{
+                background: {bg};
+                color: {color};
+                border-radius: 10px;
+                padding: 4px 10px;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+        """)
+        return label
+
+    def _stat_card(self, icon, label, value, hint, color="#2563eb"):
+        card = self._card()
+        card.setMinimumHeight(118)
+        card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        layout = QtWidgets.QHBoxLayout(card)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        icon_label = QtWidgets.QLabel(icon)
+        icon_label.setFixedSize(48, 48)
+        icon_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        icon_label.setStyleSheet(f"background: {color}; color: white; border-radius: 12px; font-size: 21px;")
+        text_layout = QtWidgets.QVBoxLayout()
+        text_layout.setSpacing(4)
+        title = QtWidgets.QLabel(label)
+        title.setWordWrap(True)
+        title.setStyleSheet("font-size: 12px; color: #1e293b; font-weight: 850; background: transparent;")
+        val = QtWidgets.QLabel(_as_text(value))
+        value_size = 20 if len(_as_text(value)) > 10 else 26
+        val.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        val.setStyleSheet(f"font-size: {value_size}px; color: {TEXT_DARK}; font-weight: 950; background: transparent;")
+        small = QtWidgets.QLabel(hint)
+        small.setWordWrap(True)
+        small.setStyleSheet("font-size: 11px; color: #64748b; font-weight: 700; background: transparent;")
+        text_layout.addWidget(title)
+        text_layout.addWidget(val)
+        text_layout.addWidget(small)
+        layout.addWidget(icon_label)
+        layout.addLayout(text_layout)
+        layout.addStretch()
+        return card
+
+    def _action_cell(self, buttons):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(6)
+        for button in buttons:
+            layout.addWidget(button)
+        layout.addStretch()
+        return widget
+
+    def _style_table(self, table, font_size=12):
+        table.verticalHeader().setVisible(False)
+        table.setShowGrid(False)
+        table.setAlternatingRowColors(False)
+        table.setSelectionBehavior(QtWidgets.QTableWidget.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QtWidgets.QTableWidget.EditTrigger.NoEditTriggers)
+        table.horizontalHeader().setMinimumSectionSize(28)
+        table.setStyleSheet(f"""
+            QTableWidget {{
+                background: white;
+                border: 1px solid #edf2f7;
+                border-radius: 10px;
+                color: #0f172a;
+                font-size: {font_size}px;
+            }}
+            QHeaderView::section {{
+                background: #f8fafc;
+                color: #475569;
+                padding: 8px 4px;
+                border: none;
+                border-bottom: 1px solid #e2e8f0;
+                font-weight: 900;
+            }}
+            QTableWidget::item {{
+                padding: 5px 4px;
+                border-bottom: 1px solid #f1f5f9;
+            }}
+            QScrollBar:vertical {{ width: 10px; }}
+            QScrollBar:horizontal {{ height: 10px; }}
+        """)
+
+    def _show_info(self, title, message):
+        QtWidgets.QMessageBox.information(self, title, message)
+
+    def _confirm(self, title, message):
+        result = QtWidgets.QMessageBox.question(
+            self,
+            title,
+            message,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return result == QtWidgets.QMessageBox.StandardButton.Yes
+
+
+class AdminListPage(AdminBasePage):
+    headers = []
+    column_widths = []
+    search_placeholder = "Tìm kiếm..."
+    search_min_width = 190
+    search_max_width = 360
+    filter_combo_width = 132
+    page_size_options = [10, 20, 50, 100]
+
+    def __init__(self, user_data=None, parent=None):
+        self.current_page = 1
+        self.page_size = 10
+        self.rows = []
+        self.filtered_rows = []
+        super().__init__(user_data, parent)
+        self._build_list_page()
+        self.refresh()
+
+    def _build_list_page(self):
+        self.stats_row = QtWidgets.QHBoxLayout()
+        self.stats_row.setSpacing(12)
+        self.content_layout.addLayout(self.stats_row)
+
+        filter_card = self._card()
+        filter_layout = QtWidgets.QHBoxLayout(filter_card)
+        filter_layout.setContentsMargins(16, 14, 16, 14)
+        filter_layout.setSpacing(10)
+        self.search_input = QtWidgets.QLineEdit()
+        self.search_input.setPlaceholderText(self.search_placeholder)
+        self.search_input.setMinimumHeight(38)
+        self.search_input.setMinimumWidth(self.search_min_width)
+        self.search_input.setMaximumWidth(self.search_max_width)
+        self.search_input.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self.search_input.setStyleSheet(FormDialog._input_style())
+        self.search_input.textChanged.connect(self._reset_and_refresh)
+        filter_layout.addWidget(self.search_input, 1)
+        self._add_filters(filter_layout)
+        filter_layout.addStretch()
+        self._add_toolbar_buttons(filter_layout)
+        self.content_layout.addWidget(filter_card)
+
+        table_card = self._card()
+        table_layout = QtWidgets.QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.setSpacing(12)
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.addWidget(self._section_title(self.table_title()))
+        title_row.addStretch()
+        self.total_label = QtWidgets.QLabel()
+        self.total_label.setStyleSheet("color: #64748b; font-weight: 800;")
+        title_row.addWidget(self.total_label)
+        table_layout.addLayout(title_row)
+
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(len(self.headers))
+        self.table.setHorizontalHeaderLabels(self.headers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setWordWrap(False)
+        self.table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setAlternatingRowColors(False)
+        self.table.setSelectionBehavior(QtWidgets.QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QtWidgets.QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setMinimumSectionSize(22)
+        self.table.horizontalHeader().setDefaultSectionSize(90)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.table.setStyleSheet("""
+            QTableWidget {
+                background: white;
+                border: 1px solid #edf2f7;
+                border-radius: 10px;
+                color: #0f172a;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background: #f8fafc;
+                color: #475569;
+                padding: 8px 4px;
+                border: none;
+                border-bottom: 1px solid #e2e8f0;
+                font-weight: 900;
+            }
+            QTableWidget::item {
+                padding: 5px 4px;
+                border-bottom: 1px solid #f1f5f9;
+            }
+            QScrollBar:vertical { width: 10px; }
+            QScrollBar:horizontal { height: 10px; }
+        """)
+        table_layout.addWidget(self.table)
+
+        pager = QtWidgets.QHBoxLayout()
+        pager.setSpacing(8)
+        pager.addWidget(QtWidgets.QLabel("Hiển thị"))
+        self.page_size_combo = QtWidgets.QComboBox()
+        self.page_size_combo.addItems([str(v) for v in self.page_size_options])
+        self.page_size_combo.setFixedWidth(72)
+        self.page_size_combo.setStyleSheet(FormDialog._input_style())
+        self.page_size_combo.currentTextChanged.connect(self._page_size_changed)
+        pager.addWidget(self.page_size_combo)
+        pager.addWidget(QtWidgets.QLabel("bản ghi"))
+        pager.addStretch()
+        self.prev_btn = self._button("‹")
+        self.prev_btn.setFixedWidth(38)
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.page_label = QtWidgets.QLabel()
+        self.page_label.setStyleSheet("font-weight: 900; color: #0f172a;")
+        self.next_btn = self._button("›")
+        self.next_btn.setFixedWidth(38)
+        self.next_btn.clicked.connect(self._next_page)
+        pager.addWidget(self.prev_btn)
+        pager.addWidget(self.page_label)
+        pager.addWidget(self.next_btn)
+        table_layout.addLayout(pager)
+        self.table_card = table_card
+        self.content_layout.addWidget(table_card)
+        self.content_layout.addStretch()
+
+    def table_title(self):
+        return self.page_title
+
+    def _combo(self, items):
+        combo = QtWidgets.QComboBox()
+        for label, value in items:
+            combo.addItem(label, value)
+        combo.setMinimumHeight(38)
+        combo.setFixedWidth(self.filter_combo_width)
+        combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+        combo.setStyleSheet(FormDialog._input_style())
+        combo.currentIndexChanged.connect(self._reset_and_refresh)
+        return combo
+
+    def _add_filters(self, layout):
+        return
+
+    def _add_toolbar_buttons(self, layout):
+        export_btn = self._button("Xuất Excel")
+        export_btn.setFixedWidth(106)
+        export_btn.clicked.connect(self.export_excel)
+        layout.addWidget(export_btn)
+
+    def _reset_and_refresh(self):
+        self.current_page = 1
+        self.refresh()
+
+    def _page_size_changed(self, value):
+        self.page_size = int(value)
+        self.current_page = 1
+        self._render_table()
+
+    def _prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self._render_table()
+
+    def _next_page(self):
+        total_pages = max(1, (len(self.filtered_rows) + self.page_size - 1) // self.page_size)
+        if self.current_page < total_pages:
+            self.current_page += 1
+            self._render_table()
+
+    def refresh(self):
+        self.rows = self.load_rows()
+        self.filtered_rows = [row for row in self.rows if self.accept_row(row)]
+        self._render_stats()
+        self._render_table()
+
+    def load_rows(self):
+        return []
+
+    def accept_row(self, row):
+        return True
+
+    def stat_cards(self):
+        return []
+
+    def _render_stats(self):
+        while self.stats_row.count():
+            item = self.stats_row.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        for card in self.stat_cards():
+            self.stats_row.addWidget(card)
+        self.stats_row.addStretch()
+
+    def _render_table(self):
+        total_pages = max(1, (len(self.filtered_rows) + self.page_size - 1) // self.page_size)
+        self.current_page = min(max(1, self.current_page), total_pages)
+        start = (self.current_page - 1) * self.page_size
+        visible = self.filtered_rows[start:start + self.page_size]
+        self.table.setRowCount(len(visible))
+        for row_index, row_data in enumerate(visible):
+            self.render_row(row_index, row_data)
+        self.total_label.setText(f"{len(self.filtered_rows)} bản ghi")
+        self.page_label.setText(f"Trang {self.current_page}/{total_pages}")
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < total_pages)
+        self.table.resizeRowsToContents()
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, max(self.table.rowHeight(row), 44))
+        self._apply_column_widths()
+        target_rows = max(len(visible), min(self.page_size, 10))
+        self.table.setMinimumHeight(42 + min(target_rows, 8) * 44 + 4)
+        self.table.setMaximumHeight(42 + max(target_rows, 8) * 44 + 80)
+
+    def _apply_column_widths(self):
+        column_count = self.table.columnCount()
+        ratios = self.column_widths if len(self.column_widths) == column_count else [1] * column_count
+        available = max(self.table.viewport().width() - 4, column_count * 28)
+        ratio_total = sum(ratios) or 1
+        used = 0
+        for column, ratio in enumerate(ratios):
+            if column == column_count - 1:
+                width = max(28, available - used)
+            else:
+                width = max(28, int(available * ratio / ratio_total))
+                used += width
+            self.table.setColumnWidth(column, width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "table"):
+            QtCore.QTimer.singleShot(0, self._apply_column_widths)
+
+    def render_row(self, row_index, row_data):
+        return
+
+    def _set_item(self, row, column, text):
+        item = QtWidgets.QTableWidgetItem(_as_text(text))
+        item.setForeground(QtGui.QColor(TEXT_DARK))
+        self.table.setItem(row, column, item)
+
+    def _action_cell(self, buttons):
+        widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(widget)
+        layout.setContentsMargins(3, 3, 3, 3)
+        layout.setSpacing(6)
+        for button in buttons:
+            layout.addWidget(button)
+        layout.addStretch()
+        return widget
+
+    def export_excel(self):
+        import xml.sax.saxutils as saxutils
+        import tempfile
+        import zipfile
+        import shutil
+
+        default_name = f"{self.page_title.lower().replace(' ', '_')}_{datetime.now().strftime('%Y_%m_%d')}.xlsx"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Xuất Excel", default_name, "Excel Files (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        def make_row_xml(index, values):
+            cells = []
+            for col_idx, val in enumerate(values):
+                col_letter = chr(65 + col_idx) if col_idx < 26 else f"{chr(64 + col_idx // 26)}{chr(65 + col_idx % 26)}"
+                cell_ref = f"{col_letter}{index}"
+                str_val = _as_text(val)
+                escaped = saxutils.escape(str_val)
+                cells.append(f'<c r="{cell_ref}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+            return f'<row r="{index}">' + "".join(cells) + "</row>"
+
+        export_headers = getattr(self, "export_headers", self.headers)
+        rows_xml = [make_row_xml(1, export_headers)]
+        for i, row in enumerate(self.filtered_rows, start=2):
+            rows_xml.append(make_row_xml(i, self.export_row(row)))
+
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' + "".join(rows_xml) + "</sheetData>"
+            '</worksheet>'
+        )
+
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>'
+            '</workbook>'
+        )
+
+        content_types_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '</Types>'
+        )
+
+        root_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        )
+
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '</Relationships>'
+        )
+
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+            os.close(tmp_fd)
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("[Content_Types].xml", content_types_xml)
+                zf.writestr("_rels/.rels", root_rels_xml)
+                zf.writestr("xl/workbook.xml", workbook_xml)
+                zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+                zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            shutil.copy2(tmp_path, path)
+            os.unlink(tmp_path)
+            self._show_info("Xuất Excel", "Đã xuất dữ liệu ra file Excel thành công.")
+        except Exception as e:
+            self._show_info("Lỗi xuất Excel", f"Không thể tạo file Excel: {e}")
+
+    def export_row(self, row):
+        return [_as_text(row.get(header.lower(), "")) for header in self.headers]
+
+
+class AdminHomePage(AdminBasePage):
+    page_title = "Dashboard Admin"
+    breadcrumb = "Tổng quan hệ thống quản trị"
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(user_data, parent)
+        self.refresh()
+
+    def refresh(self):
+        _ensure_admin_runtime_schema()
+        patients = _safe_fetch_all("SELECT * FROM Patients")
+        doctors = _safe_fetch_all("SELECT * FROM Doctors")
+        notification_limit = "LIMIT 4" if DB_TYPE == "mysql" else ""
+        notification_top = "" if DB_TYPE == "mysql" else "TOP 4"
+        notifications = _safe_fetch_all(
+            f"""
+            SELECT {notification_top} title, content, created_at
+            FROM Notifications
+            ORDER BY created_at DESC
+            {notification_limit}
+            """
+        )
+        payments = _safe_fetch_all(
+            """
+            SELECT p.*, COALESCE(invoice_service.service_name, appointment_service.service_name) AS service_name
+            FROM Payments p
+            LEFT JOIN Appointments a ON a.appointment_id = p.appointment_id
+            LEFT JOIN Services appointment_service ON appointment_service.service_id = a.service_id
+            LEFT JOIN Invoices i ON i.payment_id = p.payment_id
+            LEFT JOIN Services invoice_service ON invoice_service.service_id = i.service_id
+            ORDER BY p.payment_date DESC
+            """
+        )
+        appointments = _safe_fetch_all(
+            """
+            SELECT a.*, pa.name AS patient_name, COALESCE(appointment_service.service_name, s.service_name) AS service
+            FROM Appointments a
+            LEFT JOIN Patients pa ON pa.patient_id = a.patient_id
+            LEFT JOIN Services appointment_service ON appointment_service.service_id = a.service_id
+            LEFT JOIN Invoices i ON i.payment_id = (
+                SELECT {top_one} p2.payment_id
+                FROM Payments p2
+                WHERE p2.appointment_id = a.appointment_id
+                ORDER BY p2.payment_date DESC
+                {limit_one}
+            )
+            LEFT JOIN Services s ON s.service_id = i.service_id
+            ORDER BY a.appointment_date DESC
+            """.format(
+                top_one="" if DB_TYPE == "mysql" else "TOP 1",
+                limit_one="LIMIT 1" if DB_TYPE == "mysql" else "",
+            )
+        )
+        prescriptions = _safe_fetch_all("SELECT * FROM Prescriptions")
+
+        top = QtWidgets.QHBoxLayout()
+        top.setSpacing(16)
+        top.addWidget(self._stat_card("👥", "Tổng bệnh nhân", len(patients), "Dữ liệu theo DB hiện tại", "#2563eb"))
+        top.addWidget(self._stat_card("🩺", "Tổng bác sĩ", len(doctors), "Dữ liệu theo DB hiện tại", "#00a651"))
+        top.addWidget(self._stat_card("📅", "Tổng lịch hẹn", len(appointments), "Dữ liệu theo DB hiện tại", "#f97316"))
+        today = datetime.now().date()
+        today_rx = sum(1 for item in prescriptions if _parse_date(item.get("updated_at") or item.get("dispensed_at")) == today)
+        top.addWidget(self._stat_card("📋", "Đơn thuốc hôm nay", today_rx, "Dữ liệu theo DB hiện tại", "#8b5cf6"))
+        self.content_layout.addLayout(top)
+
+        chart_row = QtWidgets.QHBoxLayout()
+        chart_row.setSpacing(16)
+        chart_card = self._card()
+        chart_layout = QtWidgets.QVBoxLayout(chart_card)
+        chart_layout.setContentsMargins(18, 18, 18, 18)
+        chart_layout.addWidget(self._section_title("Lượt khám bệnh hằng tuần"))
+        labels, values = self._weekly_appointment_data(appointments)
+        chart_layout.addWidget(LineChartWidget(labels, values))
+        chart_row.addWidget(chart_card, 2)
+
+        chart_row.addWidget(self._revenue_panel(payments), 1)
+        self.content_layout.addLayout(chart_row)
+
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.setSpacing(16)
+        bottom.addWidget(self._appointments_panel(appointments), 1)
+        bottom.addWidget(self._notifications_panel(notifications), 1)
+        bottom.addWidget(self._quick_stats_panel(patients, doctors, appointments, prescriptions), 1)
+        self.content_layout.addLayout(bottom)
+        self.content_layout.addStretch()
+
+    def _weekly_appointment_data(self, appointments):
+        today = datetime.now().date()
+        start = today - timedelta(days=today.weekday())
+        labels = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
+        values = []
+        for offset in range(7):
+            current = start + timedelta(days=offset)
+            values.append(sum(1 for item in appointments if _parse_date(item.get("appointment_date")) == current))
+        return labels, values
+
+    def _revenue_panel(self, payments):
+        card = self._card()
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(11)
+        layout.addWidget(self._section_title("Tổng quan doanh thu"))
+        total = sum(_as_float(p.get("total_amount")) for p in payments if p.get("status") == "paid")
+        value = QtWidgets.QLabel(_format_money(total).replace(" VND", " đ"))
+        value.setStyleSheet("font-size: 27px; font-weight: 950; color: #00a651;")
+        layout.addWidget(value)
+        layout.addWidget(self._muted("Chỉ tính các giao dịch đã thanh toán"))
+        items = [("Doanh thu đã thanh toán", total, "100%", "#00a651")]
+        for label, amount, percent, color in items:
+            row = QtWidgets.QHBoxLayout()
+            dot = QtWidgets.QLabel()
+            dot.setFixedSize(9, 9)
+            dot.setStyleSheet(f"background: {color}; border-radius: 4px;")
+            row.addWidget(dot)
+            row.addWidget(self._muted(label))
+            row.addStretch()
+            row.addWidget(self._muted(_format_money(amount).replace(" VND", " đ")))
+            row.addWidget(self._muted(percent))
+            layout.addLayout(row)
+        layout.addStretch()
+        return card
+
+    def _appointments_panel(self, appointments):
+        card = self._card()
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.addWidget(self._section_title("Lịch hẹn sắp tới"))
+        upcoming = sorted(
+            [a for a in appointments if (_parse_date(a.get("appointment_date")) or date.min) >= date.today()],
+            key=lambda item: _as_text(item.get("appointment_date")),
+        )[:5]
+        if not upcoming:
+            layout.addWidget(self._muted("Chưa có lịch hẹn sắp tới"))
+            layout.addStretch()
+            return card
+        for item in upcoming:
+            layout.addWidget(self._muted(f"{item.get('patient_name', 'Bệnh nhân')} - {item.get('service', 'Khám bệnh')} - {_format_datetime(item.get('appointment_date'))}"))
+        layout.addStretch()
+        return card
+
+    def _notifications_panel(self, notifications):
+        card = self._card()
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.addWidget(self._section_title("Thông báo hệ thống"))
+        if not notifications:
+            layout.addWidget(self._muted("Chưa có thông báo hệ thống"))
+            layout.addStretch()
+            return card
+        for item in notifications:
+            text, detail = _admin_notification_copy(item)
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(self._badge(text, _status_kind(f"{text} {detail}")))
+            row.addStretch()
+            layout.addLayout(row)
+            if detail:
+                layout.addWidget(self._muted(detail))
+        layout.addStretch()
+        return card
+
+    def _quick_stats_panel(self, patients, doctors, appointments, prescriptions):
+        card = self._card()
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.addWidget(self._section_title("Thống kê nhanh"))
+        today = date.today()
+        new_patients = sum(1 for item in patients if _parse_date(item.get("created_at")) == today)
+        active_doctors = sum(1 for item in doctors if _is_active(item))
+        done = sum(1 for item in appointments if item.get("status") == "done")
+        dispensed = sum(1 for item in prescriptions if item.get("status") == "dispensed")
+        for label, value in [
+            ("Bệnh nhân mới", new_patients),
+            ("Bác sĩ hoạt động", active_doctors),
+            ("Lịch hẹn hoàn thành", done),
+            ("Đơn thuốc đã phát", dispensed),
+        ]:
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(label))
+            row.addStretch()
+            row.addWidget(self._badge(str(value), "info"))
+            layout.addLayout(row)
+        layout.addStretch()
+        return card
+
+
+class AccountManagementPage(AdminListPage):
+    page_title = "Quản lý tài khoản"
+    breadcrumb = "Dashboard / Quản lý tài khoản"
+    headers = ["☐", "STT", "Họ và tên", "Email", "Số điện thoại", "Vai trò", "Trạng thái", "Ngày tạo", "Thao tác"]
+    column_widths = [0.35, 0.45, 1.55, 2.0, 1.25, 1.25, 1.25, 1.35, 0.95]
+    search_placeholder = "Tìm kiếm tài khoản (Tên, Email, SĐT...)"
+
+    def __init__(self, user_data=None, parent=None):
+        self.selected_user_ids = set()
+        self._header_checkbox = None
+        self.load_error = ""
+        self._is_loading = False
+        self._suspend_checkbox_sync = False
+        self.empty_card = None
+        self.empty_label = None
+        self.clear_filter_btn = None
+        self.retry_btn = None
+        self.table_card = None
+        self._current_page_rows = []
+        self._search_debounce_timer = None
+        super().__init__(user_data, parent)
+
+    def _add_filters(self, layout):
+        self.role_filter = self._combo([("Tất cả vai trò", "all")] + ACCOUNT_ROLE_OPTIONS)
+        self.status_filter = self._combo([
+            ("Tất cả trạng thái", "all"),
+            ("Hoạt động", "active"),
+            ("Bị khóa", "locked"),
+            ("Đã xóa mềm", "deleted"),
+        ])
+        layout.addWidget(self.role_filter)
+        layout.addWidget(self.status_filter)
+
+    def _add_toolbar_buttons(self, layout):
+        add_btn = self._button("Thêm tài khoản", primary=True)
+        add_btn.setFixedWidth(132)
+        add_btn.clicked.connect(self.add_account)
+        layout.addWidget(add_btn)
+        export_btn = self._button("Xuất Excel")
+        export_btn.setFixedWidth(106)
+        export_btn.clicked.connect(self.export_excel)
+        layout.addWidget(export_btn)
+
+    def _build_list_page(self):
+        super()._build_list_page()
+        self.search_input.textChanged.disconnect()
+        self._search_debounce_timer = QtCore.QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.timeout.connect(self._reset_and_refresh)
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.table_card = self.table.parentWidget()
+        self.bulk_row = QtWidgets.QHBoxLayout()
+        self.bulk_row.setSpacing(8)
+        self.bulk_label = QtWidgets.QLabel("Chưa chọn tài khoản")
+        self.bulk_label.setStyleSheet("font-size: 12px; color: #64748b; font-weight: 800;")
+        self.bulk_row.addWidget(self.bulk_label)
+        self.bulk_row.addStretch()
+
+        self.bulk_lock_btn = self._button("Khóa", danger=True)
+        self.bulk_unlock_btn = self._button("Mở khóa", primary=True)
+        self.bulk_delete_btn = self._button("Xóa", danger=True)
+        self.bulk_export_btn = self._button("Xuất Excel")
+        self.bulk_assign_btn = self._button("Gán vai trò")
+        for btn in [self.bulk_lock_btn, self.bulk_unlock_btn, self.bulk_delete_btn, self.bulk_assign_btn, self.bulk_export_btn]:
+            btn.setVisible(False)
+            self.bulk_row.addWidget(btn)
+
+        self.bulk_lock_btn.clicked.connect(lambda: self._apply_bulk_status(0))
+        self.bulk_unlock_btn.clicked.connect(lambda: self._apply_bulk_status(1))
+        self.bulk_delete_btn.clicked.connect(self._bulk_soft_delete)
+        self.bulk_assign_btn.clicked.connect(self._bulk_assign_role)
+        self.bulk_export_btn.clicked.connect(self._export_selected_excel)
+
+        self.table_card.layout().insertLayout(1, self.bulk_row)
+
+        self.empty_card = self._card()
+        empty_layout = QtWidgets.QVBoxLayout(self.empty_card)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.setSpacing(10)
+        empty_icon = QtWidgets.QLabel("📭")
+        empty_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        empty_icon.setStyleSheet("font-size: 34px;")
+        self.empty_label = QtWidgets.QLabel("Không tìm thấy tài khoản phù hợp.")
+        self.empty_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet("font-size: 14px; font-weight: 800; color: #475569;")
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addStretch()
+        self.clear_filter_btn = self._button("Xóa bộ lọc")
+        self.clear_filter_btn.clicked.connect(self._clear_filters)
+        self.retry_btn = self._button("Thử lại", primary=True)
+        self.retry_btn.clicked.connect(self.refresh)
+        action_row.addWidget(self.clear_filter_btn)
+        action_row.addWidget(self.retry_btn)
+        action_row.addStretch()
+        empty_layout.addWidget(empty_icon)
+        empty_layout.addWidget(self.empty_label)
+        empty_layout.addLayout(action_row)
+        self.content_layout.insertWidget(2, self.empty_card)
+        self.empty_card.hide()
+
+    def _clear_filters(self):
+        self.search_input.clear()
+        self.role_filter.setCurrentIndex(0)
+        self.status_filter.setCurrentIndex(0)
+        self._reset_and_refresh()
+
+    def _on_search_text_changed(self):
+        if self._search_debounce_timer is not None:
+            self._search_debounce_timer.start(350)
+
+    def _reset_and_refresh(self):
+        self.current_page = 1
+        self.selected_user_ids.clear()
+        self.refresh()
+
+    def _set_loading(self, loading):
+        self._is_loading = loading
+        if hasattr(self, "search_input"):
+            self.search_input.setEnabled(not loading)
+        if hasattr(self, "role_filter"):
+            self.role_filter.setEnabled(not loading)
+        if hasattr(self, "status_filter"):
+            self.status_filter.setEnabled(not loading)
+        if hasattr(self, "page_size_combo"):
+            self.page_size_combo.setEnabled(not loading)
+        if loading:
+            self.table.setRowCount(4)
+            for row in range(4):
+                for col in range(self.table.columnCount()):
+                    self.table.setItem(row, col, QtWidgets.QTableWidgetItem("Đang tải..."))
+
+    def _sync_bulk_ui(self):
+        selected_count = len(self.selected_user_ids)
+        has_selected = selected_count > 0
+        self.bulk_label.setText(f"Đã chọn {selected_count} tài khoản" if has_selected else "Chưa chọn tài khoản")
+        for btn in [self.bulk_lock_btn, self.bulk_unlock_btn, self.bulk_delete_btn, self.bulk_assign_btn, self.bulk_export_btn]:
+            btn.setVisible(has_selected)
+
+    def load_rows(self):
+        self._set_loading(True)
+        self.load_error = ""
+        _ensure_admin_runtime_schema()
+        try:
+            rows = _safe_fetch_all(
+                """
+                SELECT
+                    u.user_id,
+                    u.username,
+                    u.role,
+                    u.is_active,
+                    u.created_at,
+                    u.deleted_at,
+                    COALESCE(d.name, p.name, u.username) AS full_name,
+                    COALESCE(d.email, p.email, '') AS email,
+                    COALESCE(d.phone, p.phone, '') AS phone,
+                    COALESCE(us.avatar_path, '') AS avatar_path,
+                    us.updated_at AS profile_updated_at
+                FROM Users u
+                LEFT JOIN Doctors d ON d.user_id = u.user_id
+                LEFT JOIN Patients p ON p.user_id = u.user_id
+                LEFT JOIN UserSettings us ON us.user_id = u.user_id
+                ORDER BY u.user_id DESC
+                """
+            ) or []
+            if not rows:
+                rows = _safe_fetch_all(
+                    """
+                    SELECT
+                        u.user_id,
+                        u.username,
+                        u.role,
+                        u.is_active,
+                        u.created_at,
+                        u.deleted_at,
+                        u.username AS full_name,
+                        '' AS email,
+                        '' AS phone,
+                        '' AS avatar_path,
+                        NULL AS profile_updated_at
+                    FROM Users u
+                    ORDER BY u.user_id DESC
+                    """
+                ) or []
+            if not rows:
+                rows = _safe_fetch_all("SELECT * FROM Users ORDER BY user_id DESC") or []
+            for row in rows:
+                row.setdefault("full_name", row.get("username") or "")
+                row.setdefault("email", "")
+                row.setdefault("phone", "")
+                row.setdefault("avatar_path", "")
+                row.setdefault("profile_updated_at", None)
+                row.setdefault("created_at", "")
+                row.setdefault("deleted_at", None)
+                row.setdefault("is_active", 1)
+            role_rows = _safe_fetch_all(
+                """
+                SELECT ura.user_id, r.role_key
+                FROM rbac_user_role_assignments ura
+                JOIN rbac_roles r ON r.role_id = ura.role_id
+                WHERE COALESCE(ura.is_active, 1) = 1
+                  AND COALESCE(r.is_active, 1) = 1
+                """
+            )
+            effective_by_user = {}
+            for role_row in role_rows:
+                effective_by_user.setdefault(role_row.get("user_id"), []).append(_as_text(role_row.get("role_key")).lower().strip())
+            for row in rows:
+                effective_roles = [role for role in effective_by_user.get(row.get("user_id"), []) if role]
+                row["effective_roles"] = effective_roles
+                preferred = next((role for role in effective_roles if role in {"receptionist", "accountant", "nurse"}), None)
+                if preferred:
+                    row["role"] = preferred
+            return rows
+        except Exception as exc:
+            self.load_error = f"Lỗi tải dữ liệu: {exc}"
+            return []
+        finally:
+            self._set_loading(False)
+
+    def accept_row(self, row):
+        selected_role = self.role_filter.currentData()
+        if selected_role == "all":
+            role_ok = True
+        elif selected_role in {"receptionist", "accountant", "nurse"}:
+            role_ok = _as_text(row.get("role")).lower().strip() == selected_role
+        else:
+            role_ok = _db_role(row.get("role")) == _db_role(selected_role)
+        deleted = bool(row.get("deleted_at"))
+        status = "deleted" if deleted else ("active" if _is_active(row) else "locked")
+        status_ok = self.status_filter.currentData() == "all" or status == self.status_filter.currentData()
+        return role_ok and status_ok and _contains(row, ["username", "full_name", "email", "phone", "role"], self.search_input.text())
+
+    def stat_cards(self):
+        active = sum(1 for row in self.rows if _is_active(row) and not row.get("deleted_at"))
+        locked = sum(1 for row in self.rows if not _is_active(row) and not row.get("deleted_at"))
+        roles = len({row.get("role") for row in self.rows if row.get("role")})
+        return [
+            self._stat_card("👥", "Tổng tài khoản", len(self.rows), "Dữ liệu theo DB hiện tại", "#2563eb"),
+            self._stat_card("👤", "Tài khoản hoạt động", active, "Dữ liệu theo DB hiện tại", "#00a651"),
+            self._stat_card("🔒", "Tài khoản bị khóa", locked, "Dữ liệu theo DB hiện tại", "#f97316"),
+            self._stat_card("🛡", "Vai trò hệ thống", roles, "Quản lý vai trò", "#8b5cf6"),
+        ]
+
+    def render_row(self, row, data):
+        checkbox = QtWidgets.QCheckBox()
+        checkbox.setChecked(data.get("user_id") in self.selected_user_ids)
+        checkbox.stateChanged.connect(lambda state, user_id=data.get("user_id"): self._toggle_selected(user_id, state))
+        check_wrap = QtWidgets.QWidget()
+        check_layout = QtWidgets.QHBoxLayout(check_wrap)
+        check_layout.setContentsMargins(0, 0, 0, 0)
+        check_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        check_layout.addWidget(checkbox)
+        self.table.setCellWidget(row, 0, check_wrap)
+        self._set_item(row, 1, row + 1)
+        display_name = _as_text(data.get("full_name") or data.get("username")).strip()
+        initial = display_name[0].upper() if display_name else "?"
+        self._set_item(row, 2, f"[{initial}] {display_name}")
+        self._set_item(row, 3, data.get("email"))
+        self._set_item(row, 4, data.get("phone"))
+        role_key = _as_text(data.get("role")).lower().strip()
+        self.table.setCellWidget(row, 5, self._badge(_role_label(role_key), ROLE_KIND.get(role_key, "info")))
+        if data.get("deleted_at"):
+            status_text = "Đã xóa mềm"
+            status_kind = "neutral"
+        else:
+            status_text = "Hoạt động" if _is_active(data) else "Bị khóa"
+            status_kind = "success" if _is_active(data) else "danger"
+        self.table.setCellWidget(row, 6, self._badge(status_text, status_kind))
+        self._set_item(row, 7, _format_datetime(data.get("created_at")))
+        lock_text = "Khóa" if _is_active(data) else "Mở"
+        view_btn = self._icon_button("Xem", "info")
+        edit_btn = self._icon_button("Sửa", "info")
+        lock_btn = self._icon_button(lock_text, "danger" if _is_active(data) else "success")
+        delete_btn = self._icon_button("Xóa", "danger")
+        reset_btn = self._icon_button("Đổi", "success")
+        view_btn.clicked.connect(lambda _, item=data: self.view_account(item))
+        edit_btn.clicked.connect(lambda _, item=data: self.edit_account(item))
+        lock_btn.clicked.connect(lambda _, item=data: self.toggle_account(item))
+        delete_btn.clicked.connect(lambda _, item=data: self.soft_delete_account(item))
+        reset_btn.clicked.connect(lambda _, item=data: self.reset_password(item))
+        self.table.setCellWidget(row, 8, self._action_cell([view_btn, edit_btn, lock_btn, reset_btn, delete_btn]))
+
+    def _toggle_selected(self, user_id, state):
+        if self._suspend_checkbox_sync:
+            return
+        if not user_id:
+            return
+        if state == int(QtCore.Qt.CheckState.Checked):
+            self.selected_user_ids.add(user_id)
+        else:
+            self.selected_user_ids.discard(user_id)
+        self._sync_bulk_ui()
+        self._sync_header_checkbox()
+
+    def _sync_header_checkbox(self):
+        if not self._header_checkbox:
+            return
+        page_ids = [row.get("user_id") for row in self._current_page_rows if row.get("user_id")]
+        if not page_ids:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            return
+        selected_in_page = sum(1 for user_id in page_ids if user_id in self.selected_user_ids)
+        self._header_checkbox.blockSignals(True)
+        if selected_in_page == 0:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        elif selected_in_page == len(page_ids):
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Checked)
+        else:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
+        self._header_checkbox.blockSignals(False)
+
+    def _toggle_select_page(self, state):
+        page_ids = [row.get("user_id") for row in self._current_page_rows if row.get("user_id")]
+        if state == int(QtCore.Qt.CheckState.Checked):
+            for user_id in page_ids:
+                self.selected_user_ids.add(user_id)
+        elif state == int(QtCore.Qt.CheckState.Unchecked):
+            for user_id in page_ids:
+                self.selected_user_ids.discard(user_id)
+        self._render_table()
+        self._sync_bulk_ui()
+
+    def _render_table(self):
+        total_pages = max(1, (len(self.filtered_rows) + self.page_size - 1) // self.page_size)
+        self.current_page = min(max(1, self.current_page), total_pages)
+        start = (self.current_page - 1) * self.page_size
+        visible = self.filtered_rows[start:start + self.page_size]
+        self._current_page_rows = visible
+        self.table.setRowCount(len(visible))
+        for row_index, row_data in enumerate(visible):
+            self.render_row(row_index, row_data)
+        self.total_label.setText(f"{len(self.filtered_rows)} bản ghi")
+        self.page_label.setText(f"Trang {self.current_page}/{total_pages}")
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < total_pages)
+        self.table.resizeRowsToContents()
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, max(self.table.rowHeight(row), 44))
+        self._apply_column_widths()
+        target_rows = max(len(visible), min(self.page_size, 10))
+        self.table.setMinimumHeight(42 + min(target_rows, 8) * 44 + 4)
+        self.table.setMaximumHeight(42 + max(target_rows, 8) * 44 + 80)
+
+        self._setup_header_checkbox()
+        self._sync_header_checkbox()
+        self._sync_bulk_ui()
+        self._update_empty_state()
+
+    def _setup_header_checkbox(self):
+        header = self.table.horizontalHeader()
+        if self._header_checkbox is not None:
+            self._header_checkbox.deleteLater()
+            self._header_checkbox = None
+        box = QtWidgets.QCheckBox(header)
+        box.setTristate(True)
+        box.stateChanged.connect(self._toggle_select_page)
+        box.show()
+        self._header_checkbox = box
+        self._position_header_checkbox()
+
+    def _position_header_checkbox(self):
+        if not self._header_checkbox:
+            return
+        header = self.table.horizontalHeader()
+        geo = header.sectionPosition(0)
+        self._header_checkbox.move(geo + max(0, int(header.sectionSize(0) / 2) - 7), 6)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_header_checkbox()
+
+    def _update_empty_state(self):
+        if not self.empty_label or not self.clear_filter_btn or not self.retry_btn or not self.empty_card or not self.table_card:
+            return
+        has_rows = len(self.filtered_rows) > 0
+        has_error = bool(self.load_error)
+        if has_error:
+            self.empty_label.setText(self.load_error)
+            self.clear_filter_btn.hide()
+            self.retry_btn.show()
+            self.empty_card.show()
+            self.table_card.hide()
+            return
+        if not has_rows:
+            self.empty_label.setText("Không tìm thấy tài khoản phù hợp.")
+            self.clear_filter_btn.show()
+            self.retry_btn.hide()
+            self.empty_card.show()
+            self.table_card.hide()
+            return
+        self.empty_card.hide()
+        self.table_card.show()
+
+    def refresh(self):
+        self.rows = self.load_rows()
+        self.filtered_rows = [row for row in self.rows if self.accept_row(row)]
+        valid_ids = {row.get("user_id") for row in self.rows}
+        self.selected_user_ids = {user_id for user_id in self.selected_user_ids if user_id in valid_ids}
+        self._render_stats()
+        self._render_table()
+        self._position_header_checkbox()
+
+    def view_account(self, item):
+        status_text = "Đã xóa mềm" if item.get("deleted_at") else ("Hoạt động" if _is_active(item) else "Bị khóa")
+        self._show_info(
+            "Chi tiết tài khoản",
+            f"Tên: {item.get('full_name') or item.get('username')}\n"
+            f"Email: {item.get('email') or 'Chưa có'}\n"
+            f"SĐT: {item.get('phone') or 'Chưa có'}\n"
+            f"Vai trò: {_role_label(item.get('role'))}\n"
+            f"Trạng thái: {status_text}\n"
+            f"Ngày tạo: {_format_datetime(item.get('created_at'))}\n"
+            f"Lần cập nhật hồ sơ: {_format_datetime(item.get('profile_updated_at'))}",
+        )
+
+    def add_account(self):
+        fields = [
+            {"key": "username", "label": "Tên đăng nhập"},
+            {"key": "full_name", "label": "Họ và tên"},
+            {"key": "email", "label": "Email"},
+            {"key": "phone", "label": "Số điện thoại"},
+            {"key": "password", "label": "Mật khẩu", "type": "password"},
+            {"key": "confirm_password", "label": "Xác nhận mật khẩu", "type": "password"},
+            {"key": "role", "label": "Vai trò", "type": "combo", "options": ACCOUNT_ROLE_OPTIONS},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Bị khóa", 0)]},
+        ]
+        dialog = FormDialog("Thêm tài khoản", fields, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        data = dialog.values()
+        if not data.get("username") or not data.get("password"):
+            self._show_info("Thiếu dữ liệu", "Vui lòng nhập tên đăng nhập và mật khẩu.")
+            return
+        if data.get("password") != data.get("confirm_password"):
+            self._show_info("Mật khẩu", "Mật khẩu xác nhận không khớp.")
+            return
+        if len(_as_text(data.get("password"))) < 6:
+            self._show_info("Mật khẩu", "Mật khẩu tối thiểu 6 ký tự.")
+            return
+        if "@" not in _as_text(data.get("email")):
+            self._show_info("Email", "Email không đúng định dạng.")
+            return
+        exists = _safe_fetch_all("SELECT user_id FROM Users WHERE username=?", (data.get("username"),))
+        if exists:
+            self._show_info("Trùng dữ liệu", "Tên đăng nhập đã tồn tại.")
+            return
+        ok = _safe_execute(
+            "INSERT INTO Users (username, password, role, is_active) VALUES (?, ?, ?, ?)",
+            (data["username"], _hash_password(data["password"]), _db_role(data["role"]), data["is_active"]),
+        )
+        if ok:
+            user = _safe_fetch_all("SELECT user_id FROM Users WHERE username=?", (data["username"],))
+            user_id = user[0].get("user_id") if user else None
+            role = data.get("role")
+            if user_id:
+                _sync_user_rbac_role(user_id, role, self.user_data.get("user_id"))
+            if role == "doctor" and user_id:
+                _safe_execute(
+                    "INSERT INTO Doctors (name, specialty, phone, email, user_id, is_active) VALUES (?, ?, ?, ?, ?, ?)",
+                    (data.get("full_name") or data.get("username"), None, data.get("phone"), data.get("email"), user_id, data.get("is_active")),
+                )
+            elif user_id:
+                _safe_execute(
+                    "INSERT INTO Patients (name, phone, email, user_id, is_active) VALUES (?, ?, ?, ?, ?)",
+                    (data.get("full_name") or data.get("username"), data.get("phone"), data.get("email"), user_id, data.get("is_active")),
+                )
+        self._show_info("Tài khoản", "Thêm tài khoản thành công" if ok else "Không thể tạo tài khoản.")
+        self.refresh()
+
+    def edit_account(self, item):
+        fields = [
+            {"key": "username", "label": "Tên đăng nhập"},
+            {"key": "full_name", "label": "Họ và tên"},
+            {"key": "email", "label": "Email"},
+            {"key": "phone", "label": "Số điện thoại"},
+            {"key": "role", "label": "Vai trò", "type": "combo", "options": ACCOUNT_ROLE_OPTIONS},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Bị khóa", 0)]},
+        ]
+        data = dict(item)
+        data["is_active"] = 1 if _is_active(item) else 0
+        dialog = FormDialog("Sửa tài khoản", fields, data, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        if "@" not in _as_text(values.get("email")):
+            self._show_info("Email", "Email không đúng định dạng.")
+            return
+        ok = _safe_execute(
+            "UPDATE Users SET username=?, role=?, is_active=? WHERE user_id=?",
+            (values["username"], _db_role(values["role"]), values["is_active"], item.get("user_id")),
+        )
+        if ok and values.get("role") == "doctor":
+            _sync_user_rbac_role(item.get("user_id"), values.get("role"), self.user_data.get("user_id"))
+            _safe_execute(
+                "UPDATE Doctors SET name=?, phone=?, email=?, is_active=? WHERE user_id=?",
+                (values.get("full_name") or values.get("username"), values.get("phone"), values.get("email"), values.get("is_active"), item.get("user_id")),
+            )
+        elif ok:
+            _sync_user_rbac_role(item.get("user_id"), values.get("role"), self.user_data.get("user_id"))
+            _safe_execute(
+                "UPDATE Patients SET name=?, phone=?, email=?, is_active=? WHERE user_id=?",
+                (values.get("full_name") or values.get("username"), values.get("phone"), values.get("email"), values.get("is_active"), item.get("user_id")),
+            )
+        self._show_info("Tài khoản", "Cập nhật tài khoản thành công" if ok else "Không thể cập nhật tài khoản.")
+        self.refresh()
+
+    def toggle_account(self, item):
+        if item.get("deleted_at"):
+            self._show_info("Trạng thái", "Tài khoản đã xóa mềm, không thể khóa/mở khóa trực tiếp.")
+            return
+        new_state = 0 if _is_active(item) else 1
+        if new_state == 0:
+            reason, ok_reason = QtWidgets.QInputDialog.getText(self, "Khóa tài khoản", "Nhập lý do khóa:")
+            if not ok_reason:
+                return
+            if not _as_text(reason).strip():
+                self._show_info("Khóa tài khoản", "Cần nhập lý do khóa.")
+                return
+        if not self._confirm("Cập nhật trạng thái", "Bạn có chắc muốn cập nhật trạng thái tài khoản này?"):
+            return
+
+        from models.user_model import UserModel
+        if new_state == 0:
+            ok, msg = UserModel.disable_user(item.get("user_id"), item.get("role"))
+        else:
+            ok = _safe_execute("UPDATE Users SET is_active=1 WHERE user_id=?", (item.get("user_id"),))
+            msg = "Thao tác thành công." if ok else "Không thể mở khóa tài khoản."
+
+        self._show_info("Tài khoản", msg if ok else f"Không thể cập nhật trạng thái: {msg}")
+        self.refresh()
+
+    def soft_delete_account(self, item):
+        if item.get("user_id") == self.user_data.get("user_id"):
+            self._show_info("Xóa tài khoản", "Không thể xóa chính tài khoản đang đăng nhập.")
+            return
+        if not self._confirm("Xóa tài khoản", "Bạn có chắc chắn muốn xóa tài khoản này không?"):
+            return
+        from models.user_model import UserModel
+        ok, msg = UserModel.delete_user(item.get("user_id"), item.get("role"))
+        self._show_info("Xóa tài khoản", "Xóa tài khoản thành công" if ok else f"Không thể xóa tài khoản: {msg}")
+        self.refresh()
+
+    def reset_password(self, item):
+        import secrets
+        import string
+        from models.user_model import UserModel
+
+        alphabet = string.ascii_letters + string.digits
+        temp_pwd = "".join(secrets.choice(alphabet) for _ in range(8))
+
+        if not self._confirm("Reset mật khẩu", f"Bạn có chắc muốn reset mật khẩu tài khoản {item.get('username')}?\n(Mật khẩu tạm thời mới sẽ được sinh ngẫu nhiên)"):
+            return
+
+        ok = UserModel.reset_password(item.get("user_id"), temp_pwd)
+        if ok:
+            self._show_info("Reset mật khẩu thành công", f"Mật khẩu tạm thời mới là: {temp_pwd}\nVui lòng gửi mật khẩu này cho người dùng. Họ sẽ bắt buộc phải đổi mật khẩu ở lần đăng nhập tiếp theo.")
+        else:
+            self._show_info("Lỗi", "Không thể reset mật khẩu.")
+
+    def _selected_rows(self):
+        selected = [row for row in self.rows if row.get("user_id") in self.selected_user_ids]
+        return selected
+
+    def _apply_bulk_status(self, new_state):
+        selected = self._selected_rows()
+        if not selected:
+            self._show_info("Thao tác hàng loạt", "Vui lòng chọn ít nhất 1 tài khoản.")
+            return
+        if not self._confirm("Thao tác hàng loạt", "Xác nhận cập nhật trạng thái cho các tài khoản đã chọn?"):
+            return
+
+        from models.user_model import UserModel
+        success_count = 0
+        fail_msgs = []
+        for row in selected:
+            if new_state == 0:
+                ok, msg = UserModel.disable_user(row.get("user_id"), row.get("role"))
+                if ok:
+                    success_count += 1
+                else:
+                    fail_msgs.append(f"{row.get('username')}: {msg}")
+            else:
+                ok = _safe_execute("UPDATE Users SET is_active=1 WHERE user_id=?", (row.get("user_id"),))
+                if ok:
+                    success_count += 1
+                else:
+                    fail_msgs.append(f"{row.get('username')}: Lỗi mở khóa")
+
+        message = f"Đã cập nhật trạng thái {success_count}/{len(selected)} tài khoản."
+        if fail_msgs:
+            message += "\nChi tiết lỗi:\n" + "\n".join(fail_msgs)
+        self._show_info("Thao tác hàng loạt", message)
+        self.refresh()
+
+    def _bulk_soft_delete(self):
+        selected = self._selected_rows()
+        if not selected:
+            self._show_info("Thao tác hàng loạt", "Vui lòng chọn ít nhất 1 tài khoản.")
+            return
+        current_user_id = self.user_data.get("user_id")
+        selected = [row for row in selected if row.get("user_id") != current_user_id]
+        if not selected:
+            self._show_info("Thao tác hàng loạt", "Không thể xóa tài khoản đang đăng nhập.")
+            return
+        if not self._confirm("Xóa hàng loạt", "Bạn có chắc chắn muốn xóa mềm các tài khoản đã chọn?"):
+            return
+
+        from models.user_model import UserModel
+        success_count = 0
+        fail_msgs = []
+        for row in selected:
+            ok, msg = UserModel.delete_user(row.get("user_id"), row.get("role"))
+            if ok:
+                success_count += 1
+            else:
+                fail_msgs.append(f"{row.get('username')}: {msg}")
+
+        message = f"Đã xóa mềm {success_count}/{len(selected)} tài khoản."
+        if fail_msgs:
+            message += "\nChi tiết lỗi:\n" + "\n".join(fail_msgs)
+        self._show_info("Xóa hàng loạt", message)
+        self.refresh()
+
+    def _bulk_assign_role(self):
+        selected = self._selected_rows()
+        if not selected:
+            self._show_info("Gán vai trò", "Vui lòng chọn ít nhất 1 tài khoản.")
+            return
+        labels = [label for label, _ in ACCOUNT_ROLE_OPTIONS]
+        role_label, ok = QtWidgets.QInputDialog.getItem(self, "Gán vai trò", "Chọn vai trò mới:", labels, editable=False)
+        if not ok:
+            return
+        role_map = {label: value for label, value in ACCOUNT_ROLE_OPTIONS}
+        selected_role = role_map.get(role_label)
+        role = _db_role(selected_role)
+        for row in selected:
+            _safe_execute("UPDATE Users SET role=? WHERE user_id=?", (role, row.get("user_id")))
+            _sync_user_rbac_role(row.get("user_id"), selected_role, self.user_data.get("user_id"))
+        self._show_info("Gán vai trò", "Đã cập nhật vai trò cho các tài khoản đã chọn.")
+        self.refresh()
+
+    def export_excel(self):
+        self._export_rows_to_excel(self.filtered_rows)
+
+    def _export_selected_excel(self):
+        rows = self._selected_rows()
+        if not rows:
+            self._show_info("Xuất Excel", "Vui lòng chọn tài khoản để xuất.")
+            return
+        self._export_rows_to_excel(rows)
+
+    def _export_rows_to_excel(self, rows):
+        default_name = f"danh-sach-tai-khoan-{datetime.now().strftime('%d-%m-%Y')}.xlsx"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Xuất Excel", default_name, "Excel Files (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        # Build a minimal valid XLSX package without third-party dependency.
+        import zipfile
+        import xml.sax.saxutils as saxutils
+
+        headers = ["STT", "Họ tên", "Email", "SĐT", "Vai trò", "Trạng thái", "Ngày tạo"]
+        table_rows = []
+        for idx, row in enumerate(rows, 1):
+            status = "Đã xóa mềm" if row.get("deleted_at") else ("Hoạt động" if _is_active(row) else "Bị khóa")
+            table_rows.append([
+                str(idx),
+                _as_text(row.get("full_name") or row.get("username")),
+                _as_text(row.get("email")),
+                _as_text(row.get("phone")),
+                _role_label(row.get("role")),
+                status,
+                _format_datetime(row.get("created_at")),
+            ])
+
+        def make_row_xml(index, values):
+            cells = []
+            for col_idx, value in enumerate(values):
+                col = chr(ord('A') + col_idx)
+                escaped = saxutils.escape(_as_text(value))
+                cells.append(f'<c r="{col}{index}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+            return f"<row r=\"{index}\">{''.join(cells)}</row>"
+
+        rows_xml = [make_row_xml(1, headers)]
+        for i, values in enumerate(table_rows, 2):
+            rows_xml.append(make_row_xml(i, values))
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' + ''.join(rows_xml) + '</sheetData>'
+            '</worksheet>'
+        )
+
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Accounts" sheetId="1" r:id="rId1"/></sheets>'
+            '</workbook>'
+        )
+
+        content_types_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '</Types>'
+        )
+
+        root_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '</Relationships>'
+        )
+
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '</Relationships>'
+        )
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(tmp_fd)
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("[Content_Types].xml", content_types_xml)
+                zf.writestr("_rels/.rels", root_rels_xml)
+                zf.writestr("xl/workbook.xml", workbook_xml)
+                zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+                zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+            shutil.copy2(tmp_path, path)
+            self._show_info("Xuất Excel", "Đã xuất Excel theo bộ lọc hiện tại.")
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def export_row(self, row):
+        status = "Đã xóa mềm" if row.get("deleted_at") else ("Hoạt động" if _is_active(row) else "Bị khóa")
+        return [
+            row.get("user_id"),
+            row.get("full_name") or row.get("username"),
+            row.get("email"),
+            row.get("phone"),
+            _role_label(row.get("role")),
+            status,
+            row.get("created_at"),
+        ]
+
+
+class DoctorManagementPage(AdminListPage):
+    page_title = "Quản lý bác sĩ"
+    breadcrumb = "Dashboard / Quản lý bác sĩ"
+    headers = ["☐", "STT", "Họ và tên", "Chuyên khoa", "SĐT", "Email", "Trạng thái", "Tình trạng", "Ngày tạo", "Thao tác"]
+    column_widths = [0.35, 0.45, 1.55, 1.35, 1.05, 1.8, 1.1, 1.15, 1.05, 0.95]
+    search_placeholder = "Tìm kiếm bác sĩ (Tên, chuyên khoa, SĐT...)"
+
+    WORK_STATUS_OPTIONS = [
+        ("Đang làm việc", "Đang làm việc"),
+        ("Nghỉ phép", "Nghỉ phép"),
+        ("Tạm nghỉ", "Tạm nghỉ"),
+        ("Đã nghỉ việc", "Đã nghỉ việc"),
+    ]
+
+    def __init__(self, user_data=None, parent=None):
+        self.selected_doctor_ids = set()
+        self._header_checkbox = None
+        self._suspend_checkbox_sync = False
+        self._current_page_rows = []
+        self.load_error = ""
+        self.empty_card = None
+        self.empty_label = None
+        self.clear_filter_btn = None
+        self.retry_btn = None
+        self.table_card = None
+        self._search_debounce_timer = None
+        super().__init__(user_data, parent)
+
+    def _add_filters(self, layout):
+        self.specialty_filter = self._combo([("Tất cả chuyên khoa", "all")])
+        self.status_filter = self._combo([
+            ("Tất cả trạng thái", "all"),
+            ("Hoạt động", "active"),
+            ("Tạm nghỉ", "paused"),
+            ("Nghỉ việc", "resigned"),
+        ])
+        self.work_status_filter = self._combo([("Tất cả tình trạng", "all")] + self.WORK_STATUS_OPTIONS)
+        layout.addWidget(self.specialty_filter)
+        layout.addWidget(self.status_filter)
+        layout.addWidget(self.work_status_filter)
+
+    def _add_toolbar_buttons(self, layout):
+        add_btn = self._button("Thêm bác sĩ", primary=True)
+        add_btn.setFixedWidth(118)
+        add_btn.clicked.connect(self.add_doctor)
+        layout.addWidget(add_btn)
+        export_btn = self._button("Xuất Excel")
+        export_btn.setFixedWidth(106)
+        export_btn.clicked.connect(self.export_excel)
+        layout.addWidget(export_btn)
+
+    def _build_list_page(self):
+        super()._build_list_page()
+        self.search_input.textChanged.disconnect()
+        self._search_debounce_timer = QtCore.QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.timeout.connect(self._reset_and_refresh)
+        self.search_input.textChanged.connect(self._on_search_text_changed)
+        self.table_card = self.table.parentWidget()
+
+        self.bulk_row = QtWidgets.QHBoxLayout()
+        self.bulk_row.setSpacing(8)
+        self.bulk_label = QtWidgets.QLabel("Chưa chọn bác sĩ")
+        self.bulk_label.setStyleSheet("font-size: 12px; color: #64748b; font-weight: 800;")
+        self.bulk_row.addWidget(self.bulk_label)
+        self.bulk_row.addStretch()
+
+        self.bulk_active_btn = self._button("Chuyển hoạt động", primary=True)
+        self.bulk_pause_btn = self._button("Chuyển tạm nghỉ")
+        self.bulk_resign_btn = self._button("Chuyển nghỉ việc", danger=True)
+        self.bulk_export_btn = self._button("Xuất đã chọn")
+        for btn in [self.bulk_active_btn, self.bulk_pause_btn, self.bulk_resign_btn, self.bulk_export_btn]:
+            btn.setVisible(False)
+            self.bulk_row.addWidget(btn)
+
+        self.bulk_active_btn.clicked.connect(lambda: self._apply_bulk_status("active"))
+        self.bulk_pause_btn.clicked.connect(lambda: self._apply_bulk_status("paused"))
+        self.bulk_resign_btn.clicked.connect(lambda: self._apply_bulk_status("resigned"))
+        self.bulk_export_btn.clicked.connect(self._export_selected_excel)
+        self.table_card.layout().insertLayout(1, self.bulk_row)
+
+        self.empty_card = self._card()
+        empty_layout = QtWidgets.QVBoxLayout(self.empty_card)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.setSpacing(10)
+        empty_icon = QtWidgets.QLabel("🩺")
+        empty_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        empty_icon.setStyleSheet("font-size: 34px;")
+        self.empty_label = QtWidgets.QLabel("Không tìm thấy bác sĩ phù hợp.")
+        self.empty_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet("font-size: 14px; font-weight: 800; color: #475569;")
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addStretch()
+        self.clear_filter_btn = self._button("Xóa bộ lọc")
+        self.clear_filter_btn.clicked.connect(self._clear_filters)
+        self.retry_btn = self._button("Thử lại", primary=True)
+        self.retry_btn.clicked.connect(self.refresh)
+        action_row.addWidget(self.clear_filter_btn)
+        action_row.addWidget(self.retry_btn)
+        action_row.addStretch()
+        empty_layout.addWidget(empty_icon)
+        empty_layout.addWidget(self.empty_label)
+        empty_layout.addLayout(action_row)
+        self.content_layout.insertWidget(2, self.empty_card)
+        self.empty_card.hide()
+
+    def _on_search_text_changed(self):
+        if self._search_debounce_timer is not None:
+            self._search_debounce_timer.start(350)
+
+    def _clear_filters(self):
+        self.search_input.clear()
+        self.specialty_filter.setCurrentIndex(0)
+        self.status_filter.setCurrentIndex(0)
+        self.work_status_filter.setCurrentIndex(0)
+        self._reset_and_refresh()
+
+    def _set_loading(self, loading):
+        self.search_input.setEnabled(not loading)
+        self.specialty_filter.setEnabled(not loading)
+        self.status_filter.setEnabled(not loading)
+        self.work_status_filter.setEnabled(not loading)
+        self.page_size_combo.setEnabled(not loading)
+        if loading:
+            self.table.setRowCount(4)
+            for row in range(4):
+                for col in range(self.table.columnCount()):
+                    self.table.setItem(row, col, QtWidgets.QTableWidgetItem("Đang tải..."))
+
+    def _sync_bulk_ui(self):
+        selected_count = len(self.selected_doctor_ids)
+        has_selected = selected_count > 0
+        self.bulk_label.setText(f"Đã chọn {selected_count} bác sĩ" if has_selected else "Chưa chọn bác sĩ")
+        for btn in [self.bulk_active_btn, self.bulk_pause_btn, self.bulk_resign_btn, self.bulk_export_btn]:
+            btn.setVisible(has_selected)
+
+    def _ensure_schema(self):
+        _ensure_admin_runtime_schema()
+
+    @staticmethod
+    def _normalize_work_status(row):
+        raw = _as_text(row.get("work_status")).strip()
+        mapping = {
+            "WORKING": "Đang làm việc",
+            "ON_LEAVE": "Nghỉ phép",
+            "LEFT": "Đã nghỉ việc",
+            "ACTIVE": "Đang làm việc",
+            "TEMPORARILY_INACTIVE": "Tạm nghỉ",
+            "RESIGNED": "Đã nghỉ việc",
+            "ĐANG LÀM VIỆC": "Đang làm việc",
+            "NGHỈ PHÉP": "Nghỉ phép",
+            "TẠM NGHỈ": "Tạm nghỉ",
+            "ĐÃ NGHỈ VIỆC": "Đã nghỉ việc",
+        }
+        if not raw:
+            value = "Đang làm việc" if _is_active(row) else "Đã nghỉ việc"
+        else:
+            value = mapping.get(raw.upper(), raw)
+        if not _is_active(row) and value in {"Đang làm việc", "Nghỉ phép", "Tạm nghỉ"}:
+            value = "Đã nghỉ việc"
+        return value
+
+    def _status_label(self, row):
+        work_status = self._normalize_work_status(row)
+        if not _is_active(row) or work_status == "Đã nghỉ việc":
+            return "Nghỉ việc"
+        if work_status in {"Nghỉ phép", "Tạm nghỉ"}:
+            return "Tạm nghỉ"
+        return "Hoạt động"
+
+    def load_rows(self):
+        self._set_loading(True)
+        self.load_error = ""
+        self._ensure_schema()
+        try:
+            rows = _safe_fetch_all(
+                """
+                SELECT doctor_id, name, specialty, phone, email, is_active, work_status, created_at, updated_at
+                FROM Doctors
+                ORDER BY doctor_id DESC
+                """
+            )
+            for row in rows:
+                row["work_status"] = self._normalize_work_status(row)
+            current = self.specialty_filter.currentData()
+            self.specialty_filter.blockSignals(True)
+            self.specialty_filter.clear()
+            self.specialty_filter.addItem("Tất cả chuyên khoa", "all")
+            for specialty in sorted({_as_text(row.get("specialty")) for row in rows if row.get("specialty")}):
+                self.specialty_filter.addItem(specialty, specialty)
+            index = self.specialty_filter.findData(current)
+            self.specialty_filter.setCurrentIndex(max(index, 0))
+            self.specialty_filter.blockSignals(False)
+            return rows
+        except Exception as exc:
+            self.load_error = f"Không thể tải danh sách bác sĩ. {exc}"
+            return []
+        finally:
+            self._set_loading(False)
+
+    def accept_row(self, row):
+        specialty_ok = self.specialty_filter.currentData() == "all" or row.get("specialty") == self.specialty_filter.currentData()
+        status_value = self.status_filter.currentData()
+        status_label = self._status_label(row)
+        status_ok = (
+            status_value == "all"
+            or (status_value == "active" and status_label == "Hoạt động")
+            or (status_value == "paused" and status_label == "Tạm nghỉ")
+            or (status_value == "resigned" and status_label == "Nghỉ việc")
+        )
+        work_choice = self.work_status_filter.currentData()
+        work_status = self._normalize_work_status(row)
+        work_ok = work_choice == "all" or work_choice == work_status
+        search_ok = _contains(row, ["name", "specialty", "phone", "email"], self.search_input.text())
+        if not search_ok:
+            query = _as_text(self.search_input.text()).strip().lower()
+            search_ok = bool(query) and (query in status_label.lower() or query in work_status.lower())
+        return specialty_ok and status_ok and work_ok and search_ok
+
+    def stat_cards(self):
+        active = sum(1 for row in self.rows if self._status_label(row) == "Hoạt động")
+        paused = sum(1 for row in self.rows if self._status_label(row) == "Tạm nghỉ")
+        resigned = sum(1 for row in self.rows if self._status_label(row) == "Nghỉ việc")
+        return [
+            self._stat_card("🩺", "Tổng bác sĩ", len(self.rows), "Dữ liệu theo DB hiện tại", "#2563eb"),
+            self._stat_card("👤", "Đang hoạt động", active, "Dữ liệu theo DB hiện tại", "#00a651"),
+            self._stat_card("⏸", "Tạm nghỉ", paused, "Dữ liệu theo DB hiện tại", "#f97316"),
+            self._stat_card("🚫", "Nghỉ việc", resigned, "Dữ liệu theo DB hiện tại", "#8b5cf6"),
+        ]
+
+    def render_row(self, row, data):
+        checkbox = QtWidgets.QCheckBox()
+        checkbox.setChecked(data.get("doctor_id") in self.selected_doctor_ids)
+        checkbox.stateChanged.connect(lambda state, doctor_id=data.get("doctor_id"): self._toggle_selected(doctor_id, state))
+        check_wrap = QtWidgets.QWidget()
+        check_layout = QtWidgets.QHBoxLayout(check_wrap)
+        check_layout.setContentsMargins(0, 0, 0, 0)
+        check_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        check_layout.addWidget(checkbox)
+        self.table.setCellWidget(row, 0, check_wrap)
+
+        stt = (self.current_page - 1) * self.page_size + row + 1
+        self._set_item(row, 1, stt)
+        self._set_item(row, 2, f"👨‍⚕️ {_as_text(data.get('name'))}")
+        self._set_item(row, 3, data.get("specialty"))
+        self._set_item(row, 4, data.get("phone"))
+        self._set_item(row, 5, data.get("email"))
+
+        status_text = self._status_label(data)
+        status_kind = "success" if status_text == "Hoạt động" else ("warning" if status_text == "Tạm nghỉ" else "danger")
+        self.table.setCellWidget(row, 6, self._badge(status_text, status_kind))
+
+        work_status = self._normalize_work_status(data)
+        work_kind = "success" if work_status == "Đang làm việc" else ("warning" if work_status in {"Nghỉ phép", "Tạm nghỉ"} else "danger")
+        self.table.setCellWidget(row, 7, self._badge(work_status, work_kind))
+
+        self._set_item(row, 8, _format_date(data.get("created_at")))
+        view_btn = self._icon_button("Xem", "info")
+        edit_btn = self._icon_button("Sửa", "info")
+        del_btn = self._icon_button("Xóa", "danger")
+        view_btn.clicked.connect(lambda _, item=data: self.view_detail(item))
+        edit_btn.clicked.connect(lambda _, item=data: self.edit_doctor(item))
+        del_btn.clicked.connect(lambda _, item=data: self.soft_delete(item))
+        self.table.setCellWidget(row, 9, self._action_cell([view_btn, edit_btn, del_btn]))
+
+    def _toggle_selected(self, doctor_id, state):
+        if self._suspend_checkbox_sync or not doctor_id:
+            return
+        if state == int(QtCore.Qt.CheckState.Checked):
+            self.selected_doctor_ids.add(doctor_id)
+        else:
+            self.selected_doctor_ids.discard(doctor_id)
+        self._sync_bulk_ui()
+        self._sync_header_checkbox()
+
+    def _sync_header_checkbox(self):
+        if not self._header_checkbox:
+            return
+        page_ids = [row.get("doctor_id") for row in self._current_page_rows if row.get("doctor_id")]
+        if not page_ids:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            return
+        selected_in_page = sum(1 for doctor_id in page_ids if doctor_id in self.selected_doctor_ids)
+        self._header_checkbox.blockSignals(True)
+        if selected_in_page == 0:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Unchecked)
+        elif selected_in_page == len(page_ids):
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.Checked)
+        else:
+            self._header_checkbox.setCheckState(QtCore.Qt.CheckState.PartiallyChecked)
+        self._header_checkbox.blockSignals(False)
+
+    def _toggle_select_page(self, state):
+        page_ids = [row.get("doctor_id") for row in self._current_page_rows if row.get("doctor_id")]
+        if state == int(QtCore.Qt.CheckState.Checked):
+            for doctor_id in page_ids:
+                self.selected_doctor_ids.add(doctor_id)
+        elif state == int(QtCore.Qt.CheckState.Unchecked):
+            for doctor_id in page_ids:
+                self.selected_doctor_ids.discard(doctor_id)
+        self._render_table()
+        self._sync_bulk_ui()
+
+    def _setup_header_checkbox(self):
+        header = self.table.horizontalHeader()
+        if self._header_checkbox is not None:
+            self._header_checkbox.deleteLater()
+            self._header_checkbox = None
+        box = QtWidgets.QCheckBox(header)
+        box.setTristate(True)
+        box.stateChanged.connect(self._toggle_select_page)
+        box.show()
+        self._header_checkbox = box
+        self._position_header_checkbox()
+
+    def _position_header_checkbox(self):
+        if not self._header_checkbox:
+            return
+        header = self.table.horizontalHeader()
+        geo = header.sectionPosition(0)
+        self._header_checkbox.move(geo + max(0, int(header.sectionSize(0) / 2) - 7), 6)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_header_checkbox()
+
+    def _update_empty_state(self):
+        if not self.empty_label or not self.clear_filter_btn or not self.retry_btn or not self.empty_card or not self.table_card:
+            return
+        has_rows = len(self.filtered_rows) > 0
+        has_error = bool(self.load_error)
+        if has_error:
+            self.empty_label.setText(self.load_error)
+            self.clear_filter_btn.hide()
+            self.retry_btn.show()
+            self.empty_card.show()
+            self.table_card.hide()
+            return
+        if not has_rows:
+            self.empty_label.setText("Không tìm thấy bác sĩ phù hợp.")
+            self.clear_filter_btn.show()
+            self.retry_btn.hide()
+            self.empty_card.show()
+            self.table_card.hide()
+            return
+        self.empty_card.hide()
+        self.table_card.show()
+
+    def _render_table(self):
+        total_pages = max(1, (len(self.filtered_rows) + self.page_size - 1) // self.page_size)
+        self.current_page = min(max(1, self.current_page), total_pages)
+        start = (self.current_page - 1) * self.page_size
+        visible = self.filtered_rows[start:start + self.page_size]
+        self._current_page_rows = visible
+        self.table.setRowCount(len(visible))
+        for row_index, row_data in enumerate(visible):
+            self.render_row(row_index, row_data)
+        self.total_label.setText(f"{len(self.filtered_rows)} bản ghi")
+        self.page_label.setText(f"Trang {self.current_page}/{total_pages}")
+        self.prev_btn.setEnabled(self.current_page > 1)
+        self.next_btn.setEnabled(self.current_page < total_pages)
+        self.table.resizeRowsToContents()
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, max(self.table.rowHeight(row), 44))
+        self._apply_column_widths()
+        target_rows = max(len(visible), min(self.page_size, 10))
+        self.table.setMinimumHeight(42 + min(target_rows, 8) * 44 + 4)
+        self.table.setMaximumHeight(42 + max(target_rows, 8) * 44 + 80)
+        self._setup_header_checkbox()
+        self._sync_header_checkbox()
+        self._sync_bulk_ui()
+        self._update_empty_state()
+
+    def refresh(self):
+        self.rows = self.load_rows()
+        self.filtered_rows = [row for row in self.rows if self.accept_row(row)]
+        valid_ids = {row.get("doctor_id") for row in self.rows}
+        self.selected_doctor_ids = {doctor_id for doctor_id in self.selected_doctor_ids if doctor_id in valid_ids}
+        self._render_stats()
+        self._render_table()
+        self._position_header_checkbox()
+
+    @staticmethod
+    def _email_valid(email):
+        text = _as_text(email).strip()
+        return not text or ("@" in text and not text.startswith("@") and not text.endswith("@"))
+
+    @staticmethod
+    def _phone_valid(phone):
+        digits = "".join(ch for ch in _as_text(phone) if ch.isdigit())
+        return 9 <= len(digits) <= 11
+
+    def _doctor_fields(self):
+        return [
+            {"key": "name", "label": "Họ và tên"},
+            {"key": "specialty", "label": "Chuyên khoa"},
+            {"key": "phone", "label": "SĐT"},
+            {"key": "email", "label": "Email"},
+            {
+                "key": "is_active",
+                "label": "Trạng thái",
+                "type": "combo",
+                "options": [("Hoạt động", 1), ("Nghỉ việc", 0)],
+            },
+            {
+                "key": "work_status",
+                "label": "Tình trạng",
+                "type": "combo",
+                "options": self.WORK_STATUS_OPTIONS,
+            },
+        ]
+
+    def _validate_doctor_payload(self, data, current_id=None):
+        if not _as_text(data.get("name")).strip():
+            return "Họ và tên không được để trống."
+        if not _as_text(data.get("specialty")).strip():
+            return "Vui lòng chọn hoặc nhập chuyên khoa."
+        if not self._phone_valid(data.get("phone")):
+            return "Số điện thoại phải có từ 9 đến 11 chữ số."
+        if not self._email_valid(data.get("email")):
+            return "Email không đúng định dạng."
+
+        if _as_text(data.get("email")).strip():
+            rows = _safe_fetch_all("SELECT doctor_id FROM Doctors WHERE email=?", (data.get("email"),))
+            for row in rows:
+                if current_id is None or str(row.get("doctor_id")) != str(current_id):
+                    return "Email đã tồn tại."
+        rows = _safe_fetch_all("SELECT doctor_id FROM Doctors WHERE phone=?", (data.get("phone"),))
+        for row in rows:
+            if current_id is None or str(row.get("doctor_id")) != str(current_id):
+                return "Số điện thoại đã tồn tại."
+        return ""
+
+    def add_doctor(self):
+        dialog = FormDialog("Thêm bác sĩ", self._doctor_fields(), {"is_active": 1, "work_status": "Đang làm việc"}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        data = dialog.values()
+        if int(data.get("is_active") or 0) == 0:
+            data["work_status"] = "Đã nghỉ việc"
+        error = self._validate_doctor_payload(data)
+        if error:
+            self._show_info("Thiếu dữ liệu", error)
+            return
+        ok = _safe_execute(
+            """
+            INSERT INTO Doctors (name, specialty, phone, email, is_active, work_status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (data["name"], data["specialty"], data["phone"], data["email"], data["is_active"], data["work_status"]),
+        )
+        if not ok:
+            ok = _safe_execute(
+                "INSERT INTO Doctors (name, specialty, phone, email, is_active) VALUES (?, ?, ?, ?, ?)",
+                (data["name"], data["specialty"], data["phone"], data["email"], data["is_active"]),
+            )
+        self._show_info("Bác sĩ", "Thêm bác sĩ thành công." if ok else "Không thể thêm bác sĩ.")
+        self.refresh()
+
+    def edit_doctor(self, item):
+        data = dict(item)
+        data["is_active"] = 1 if _is_active(item) else 0
+        data["work_status"] = self._normalize_work_status(item)
+        dialog = FormDialog("Sửa bác sĩ", self._doctor_fields(), data, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        if int(values.get("is_active") or 0) == 0:
+            values["work_status"] = "Đã nghỉ việc"
+        error = self._validate_doctor_payload(values, item.get("doctor_id"))
+        if error:
+            self._show_info("Thiếu dữ liệu", error)
+            return
+        ok = _safe_execute(
+            """
+            UPDATE Doctors
+            SET name=?, specialty=?, phone=?, email=?, is_active=?, work_status=?, updated_at=CURRENT_TIMESTAMP
+            WHERE doctor_id=?
+            """,
+            (
+                values["name"],
+                values["specialty"],
+                values["phone"],
+                values["email"],
+                values["is_active"],
+                values["work_status"],
+                item.get("doctor_id"),
+            ),
+        )
+        if not ok:
+            ok = _safe_execute(
+                "UPDATE Doctors SET name=?, specialty=?, phone=?, email=?, is_active=? WHERE doctor_id=?",
+                (
+                    values["name"],
+                    values["specialty"],
+                    values["phone"],
+                    values["email"],
+                    values["is_active"],
+                    item.get("doctor_id"),
+                ),
+            )
+        self._show_info("Bác sĩ", "Đã cập nhật bác sĩ." if ok else "Không thể cập nhật bác sĩ.")
+        self.refresh()
+
+    def view_detail(self, item):
+        self._show_info(
+            "Chi tiết bác sĩ",
+            f"Mã bác sĩ: {item.get('doctor_id')}\n"
+            f"Họ và tên: {item.get('name')}\n"
+            f"Chuyên khoa: {item.get('specialty') or 'Chưa cập nhật'}\n"
+            f"SĐT: {item.get('phone') or 'Chưa cập nhật'}\n"
+            f"Email: {item.get('email') or 'Chưa cập nhật'}\n"
+            f"Trạng thái: {self._status_label(item)}\n"
+            f"Tình trạng: {self._normalize_work_status(item)}\n"
+            f"Ngày tạo: {_format_date(item.get('created_at'))}\n"
+            f"Cập nhật gần nhất: {_format_datetime(item.get('updated_at'))}",
+        )
+
+    def soft_delete(self, item):
+        if not self._confirm("Xóa bác sĩ", "Bác sĩ sẽ được chuyển sang trạng thái nghỉ việc. Tiếp tục?"):
+            return
+        related = _safe_fetch_all(
+            "SELECT COUNT(*) AS total FROM Appointments WHERE doctor_id=?",
+            (item.get("doctor_id"),),
+        )
+        related_count = _as_int((related[0] if related else {}).get("total"))
+        ok = _safe_execute(
+            "UPDATE Doctors SET is_active=0, work_status='Đã nghỉ việc', updated_at=CURRENT_TIMESTAMP WHERE doctor_id=?",
+            (item.get("doctor_id"),),
+        )
+        if ok and related_count > 0:
+            self._show_info(
+                "Bác sĩ",
+                "Bác sĩ đã có dữ liệu lịch khám nên hệ thống áp dụng ngừng hoạt động (soft delete) thay vì xóa cứng.",
+            )
+        else:
+            self._show_info("Bác sĩ", "Đã ngừng hoạt động bác sĩ." if ok else "Không thể cập nhật trạng thái.")
+        self.refresh()
+
+    def _selected_rows(self):
+        return [row for row in self.rows if row.get("doctor_id") in self.selected_doctor_ids]
+
+    def _apply_bulk_status(self, mode):
+        selected = self._selected_rows()
+        if not selected:
+            self._show_info("Thao tác hàng loạt", "Vui lòng chọn ít nhất 1 bác sĩ.")
+            return
+        if not self._confirm("Thao tác hàng loạt", "Xác nhận cập nhật trạng thái cho các bác sĩ đã chọn?"):
+            return
+        success_count = 0
+        for row in selected:
+            doctor_id = row.get("doctor_id")
+            if mode == "active":
+                ok = _safe_execute(
+                    "UPDATE Doctors SET is_active=1, work_status='Đang làm việc', updated_at=CURRENT_TIMESTAMP WHERE doctor_id=?",
+                    (doctor_id,),
+                )
+            elif mode == "paused":
+                ok = _safe_execute(
+                    "UPDATE Doctors SET is_active=1, work_status='Tạm nghỉ', updated_at=CURRENT_TIMESTAMP WHERE doctor_id=?",
+                    (doctor_id,),
+                )
+            else:
+                ok = _safe_execute(
+                    "UPDATE Doctors SET is_active=0, work_status='Đã nghỉ việc', updated_at=CURRENT_TIMESTAMP WHERE doctor_id=?",
+                    (doctor_id,),
+                )
+            if ok:
+                success_count += 1
+        if success_count == len(selected):
+            self._show_info("Thao tác hàng loạt", "Đã cập nhật trạng thái các bác sĩ đã chọn.")
+        elif success_count == 0:
+            self._show_info("Thao tác hàng loạt", "Không thể cập nhật trạng thái bác sĩ nào.")
+        else:
+            self._show_info(
+                "Thao tác hàng loạt",
+                f"Đã cập nhật {success_count}/{len(selected)} bác sĩ. Vui lòng kiểm tra lại các bản ghi còn lại.",
+            )
+        self.refresh()
+
+    def export_excel(self):
+        options = [
+            "Xuất theo bộ lọc hiện tại",
+            "Xuất toàn bộ danh sách",
+            "Xuất các dòng đã chọn",
+        ]
+        choice, ok = QtWidgets.QInputDialog.getItem(self, "Xuất Excel", "Chọn phạm vi xuất:", options, editable=False)
+        if not ok:
+            return
+        if choice == options[0]:
+            rows = self.filtered_rows
+        elif choice == options[1]:
+            rows = self.rows
+        else:
+            rows = self._selected_rows()
+        if not rows:
+            self._show_info("Xuất Excel", "Không có dữ liệu để xuất theo lựa chọn hiện tại.")
+            return
+        self._export_rows_to_excel(rows)
+
+    def _export_selected_excel(self):
+        rows = self._selected_rows()
+        if not rows:
+            self._show_info("Xuất Excel", "Vui lòng chọn bác sĩ để xuất.")
+            return
+        self._export_rows_to_excel(rows)
+
+    def _export_rows_to_excel(self, rows):
+        default_name = f"danh_sach_bac_si_{datetime.now().strftime('%Y_%m_%d')}.xlsx"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Xuất Excel", default_name, "Excel Files (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+
+        import zipfile
+        import xml.sax.saxutils as saxutils
+
+        headers = ["STT", "Họ và tên", "Chuyên khoa", "SĐT", "Email", "Trạng thái", "Tình trạng", "Ngày tạo", "Ngày cập nhật"]
+        table_rows = []
+        for idx, row in enumerate(rows, 1):
+            table_rows.append([
+                str(idx),
+                _as_text(row.get("name")),
+                _as_text(row.get("specialty")),
+                _as_text(row.get("phone")),
+                _as_text(row.get("email")),
+                self._status_label(row),
+                self._normalize_work_status(row),
+                _format_date(row.get("created_at")),
+                _format_datetime(row.get("updated_at")),
+            ])
+
+        def make_row_xml(index, values):
+            cells = []
+            for col_idx, value in enumerate(values):
+                col = chr(ord("A") + col_idx)
+                escaped = saxutils.escape(_as_text(value))
+                cells.append(f'<c r="{col}{index}" t="inlineStr"><is><t>{escaped}</t></is></c>')
+            return f"<row r=\"{index}\">{''.join(cells)}</row>"
+
+        rows_xml = [make_row_xml(1, headers)]
+        for i, values in enumerate(table_rows, 2):
+            rows_xml.append(make_row_xml(i, values))
+        sheet_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData>' + "".join(rows_xml) + "</sheetData>"
+            "</worksheet>"
+        )
+
+        workbook_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="Doctors" sheetId="1" r:id="rId1"/></sheets>'
+            "</workbook>"
+        )
+
+        content_types_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            "</Types>"
+        )
+
+        root_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            "</Relationships>"
+        )
+
+        workbook_rels_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>"
+        )
+
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(tmp_fd)
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+            try:
+                with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr("[Content_Types].xml", content_types_xml)
+                    zf.writestr("_rels/.rels", root_rels_xml)
+                    zf.writestr("xl/workbook.xml", workbook_xml)
+                    zf.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
+                    zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+                shutil.copy2(tmp_path, path)
+                self._show_info("Xuất Excel", "Đã xuất Excel theo lựa chọn hiện tại.")
+            except Exception as exc:
+                self._show_info("Xuất Excel", f"Không thể xuất Excel: {exc}")
+        finally:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def export_row(self, row):
+        return [
+            row.get("doctor_id"),
+            row.get("name"),
+            row.get("specialty"),
+            row.get("phone"),
+            row.get("email"),
+            self._status_label(row),
+            self._normalize_work_status(row),
+            _format_date(row.get("created_at")),
+            _format_datetime(row.get("updated_at")),
+        ]
+
+
+class PatientManagementPage(AdminListPage):
+    page_title = "Quản lý bệnh nhân"
+    breadcrumb = "Dashboard / Quản lý bệnh nhân"
+    headers = ["☐", "STT", "Họ và tên", "Giới tính", "Ngày sinh", "SĐT", "CCCD/CMND", "Email", "Địa chỉ", "Trạng thái", "Thao tác"]
+    column_widths = [0.35, 0.45, 1.45, 0.75, 1.0, 1.05, 1.25, 1.75, 1.0, 1.15, 0.9]
+    search_placeholder = "Tìm kiếm bệnh nhân (Tên, SĐT, CCCD, Email...)"
+
+    def _add_filters(self, layout):
+        self.gender_filter = self._combo([("Tất cả giới tính", "all"), ("Nam", "Nam"), ("Nữ", "Nữ")])
+        self.age_filter = self._combo([("Tất cả nhóm tuổi", "all"), ("< 18", "under18"), ("18-60", "adult"), ("> 60", "senior")])
+        self.status_filter = self._combo([("Tất cả trạng thái", "all"), ("Hoạt động", "active"), ("Ngưng hoạt động", "inactive")])
+        layout.addWidget(self.gender_filter)
+        layout.addWidget(self.age_filter)
+        layout.addWidget(self.status_filter)
+
+    def _add_toolbar_buttons(self, layout):
+        add_btn = self._button("Thêm bệnh nhân", primary=True)
+        add_btn.setFixedWidth(138)
+        add_btn.clicked.connect(self.add_patient)
+        layout.addWidget(add_btn)
+        super()._add_toolbar_buttons(layout)
+
+    def load_rows(self):
+        return _safe_fetch_all("SELECT * FROM Patients ORDER BY patient_id DESC")
+
+    def accept_row(self, row):
+        gender_ok = self.gender_filter.currentData() == "all" or row.get("gender") == self.gender_filter.currentData()
+        age = _age_from_dob(row.get("dob"))
+        age_choice = self.age_filter.currentData()
+        age_ok = (
+            age_choice == "all"
+            or (age is not None and age_choice == "under18" and age < 18)
+            or (age is not None and age_choice == "adult" and 18 <= age <= 60)
+            or (age is not None and age_choice == "senior" and age > 60)
+        )
+        status = "active" if _is_active(row) else "inactive"
+        status_ok = self.status_filter.currentData() == "all" or status == self.status_filter.currentData()
+        return gender_ok and age_ok and status_ok and _contains(row, ["name", "phone", "cccd", "email"], self.search_input.text())
+
+    def stat_cards(self):
+        active_rows = [row for row in self.rows if _is_active(row)]
+        today = date.today()
+        month_start = today.replace(day=1)
+        new_count = sum(1 for row in self.rows if (_parse_date(row.get("created_at")) or date.min) >= month_start)
+        male = sum(1 for row in active_rows if row.get("gender") == "Nam")
+        female = sum(1 for row in active_rows if row.get("gender") == "Nữ")
+        return [
+            self._stat_card("👥", "Tổng bệnh nhân", len(active_rows), "Dữ liệu theo DB hiện tại", "#2563eb"),
+            self._stat_card("💚", "Bệnh nhân mới", new_count, "Dữ liệu theo DB hiện tại", "#00a651"),
+            self._stat_card("♂", "Bệnh nhân nam", male, "Dữ liệu theo DB hiện tại", "#f97316"),
+            self._stat_card("♀", "Bệnh nhân nữ", female, "Dữ liệu theo DB hiện tại", "#8b5cf6"),
+        ]
+
+    def render_row(self, row, data):
+        self._set_item(row, 0, "☐")
+        self._set_item(row, 1, row + 1)
+        self._set_item(row, 2, f"👤 {_as_text(data.get('name'))}")
+        self._set_item(row, 3, data.get("gender"))
+        self._set_item(row, 4, _format_date(data.get("dob")))
+        self._set_item(row, 5, data.get("phone"))
+        self._set_item(row, 6, data.get("cccd"))
+        self._set_item(row, 7, data.get("email"))
+        self._set_item(row, 8, data.get("address"))
+        self.table.setCellWidget(row, 9, self._badge("Hoạt động" if _is_active(data) else "Ngưng hoạt động"))
+        view_btn = self._icon_button("Xem", "info")
+        edit_btn = self._icon_button("Sửa", "info")
+        del_btn = self._icon_button("Xóa", "danger")
+        view_btn.clicked.connect(lambda _, item=data: self.view_detail(item))
+        edit_btn.clicked.connect(lambda _, item=data: self.edit_patient(item))
+        del_btn.clicked.connect(lambda _, item=data: self.soft_delete(item))
+        self.table.setCellWidget(row, 10, self._action_cell([view_btn, edit_btn, del_btn]))
+
+    def _patient_fields(self):
+        return [
+            {"key": "name", "label": "Họ và tên"},
+            {"key": "dob", "label": "Ngày sinh", "type": "date"},
+            {"key": "gender", "label": "Giới tính", "type": "combo", "options": [("Nam", "Nam"), ("Nữ", "Nữ")]},
+            {"key": "phone", "label": "SĐT"},
+            {"key": "cccd", "label": "CCCD/CMND"},
+            {"key": "email", "label": "Email"},
+            {"key": "address", "label": "Địa chỉ"},
+            {"key": "occupation", "label": "Nghề nghiệp"},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Ngưng hoạt động", 0)]},
+        ]
+
+    def add_patient(self):
+        dialog = FormDialog("Thêm bệnh nhân", self._patient_fields(), {"gender": "Nam", "is_active": 1}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        data = dialog.values()
+        ok = _safe_execute(
+            """
+            INSERT INTO Patients (name, dob, gender, phone, cccd, email, address, occupation, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (data["name"], data["dob"], data["gender"], data["phone"], data["cccd"], data["email"], data["address"], data["occupation"], data["is_active"]),
+        )
+        self._show_info("Bệnh nhân", "Đã thêm bệnh nhân." if ok else "Không thể thêm bệnh nhân.")
+        self.refresh()
+
+    def edit_patient(self, item):
+        data = dict(item)
+        data["is_active"] = 1 if _is_active(item) else 0
+        dialog = FormDialog("Sửa bệnh nhân", self._patient_fields(), data, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        ok = _safe_execute(
+            """
+            UPDATE Patients
+            SET name=?, dob=?, gender=?, phone=?, cccd=?, email=?, address=?, occupation=?, is_active=?
+            WHERE patient_id=?
+            """,
+            (values["name"], values["dob"], values["gender"], values["phone"], values["cccd"], values["email"], values["address"], values["occupation"], values["is_active"], item.get("patient_id")),
+        )
+        self._show_info("Bệnh nhân", "Đã cập nhật bệnh nhân." if ok else "Không thể cập nhật bệnh nhân.")
+        self.refresh()
+
+    def view_detail(self, item):
+        self._show_info(
+            "Chi tiết bệnh nhân",
+            f"{item.get('name')}\nDOB: {_format_date(item.get('dob'))}\nSĐT: {item.get('phone')}\nCCCD: {item.get('cccd') or 'Chưa có'}\nEmail: {item.get('email') or 'Chưa có'}\nĐịa chỉ: {item.get('address') or 'Chưa có'}",
+        )
+
+    def soft_delete(self, item):
+        if not self._confirm("Xóa bệnh nhân", "Hồ sơ bệnh nhân sẽ được ngưng hoạt động để giữ lịch sử y tế. Tiếp tục?"):
+            return
+        ok = _safe_execute("UPDATE Patients SET is_active=0 WHERE patient_id=?", (item.get("patient_id"),))
+        self._show_info("Bệnh nhân", "Đã ngưng hoạt động bệnh nhân." if ok else "Không thể cập nhật trạng thái.")
+        self.refresh()
+
+    def export_row(self, row):
+        return [row.get("patient_id"), row.get("name"), row.get("gender"), row.get("dob"), row.get("phone"), row.get("cccd"), row.get("email"), _is_active(row)]
+
+
+class MedicineManagementPage(AdminListPage):
+    page_title = "Quản lý thuốc"
+    breadcrumb = "Dashboard / Quản lý thuốc"
+    headers = ["☐", "STT", "Tên thuốc", "Hoạt chất", "Danh mục", "Đơn vị", "Nhà cung cấp", "Số lượng", "Giá nhập", "Giá bán", "Trạng thái", "Thao tác"]
+    column_widths = [0.32, 0.45, 1.35, 1.05, 1.35, 0.75, 1.25, 0.8, 0.9, 0.9, 1.05, 0.9]
+    search_placeholder = "Tìm kiếm thuốc (Tên thuốc, hoạt chất, mã thuốc...)"
+
+    def _add_filters(self, layout):
+        self.category_filter = self._combo([("Danh mục: Tất cả", "all")])
+        self.supplier_filter = self._combo([("Nhà cung cấp: Tất cả", "all")])
+        self.stock_filter = self._combo([("Trạng thái: Tất cả", "all"), ("Còn hàng", "available"), ("Sắp hết", "low"), ("Hết hàng", "empty")])
+        layout.addWidget(self.category_filter)
+        layout.addWidget(self.supplier_filter)
+        layout.addWidget(self.stock_filter)
+
+    def _add_toolbar_buttons(self, layout):
+        add_btn = self._button("Thêm thuốc", primary=True)
+        add_btn.setFixedWidth(112)
+        add_btn.clicked.connect(self.add_medicine)
+        layout.addWidget(add_btn)
+        super()._add_toolbar_buttons(layout)
+
+    def load_rows(self):
+        rows = _safe_fetch_all("SELECT * FROM Medicines ORDER BY medicine_id DESC")
+        self._sync_combo(self.category_filter, "Danh mục: Tất cả", {row.get("category") for row in rows if row.get("category")})
+        self._sync_combo(self.supplier_filter, "Nhà cung cấp: Tất cả", {row.get("supplier") for row in rows if row.get("supplier")})
+        return rows
+
+    def _sync_combo(self, combo, first_label, values):
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(first_label, "all")
+        for value in sorted(values):
+            combo.addItem(_as_text(value), value)
+        index = combo.findData(current)
+        combo.setCurrentIndex(max(index, 0))
+        combo.blockSignals(False)
+
+    def _stock_state(self, row):
+        qty = _as_int(row.get("quantity"))
+        if qty <= 0:
+            return "empty", "Hết hàng"
+        if qty <= 350:
+            return "low", "Sắp hết"
+        return "available", "Còn hàng"
+
+    def accept_row(self, row):
+        stock_key, _ = self._stock_state(row)
+        category_ok = self.category_filter.currentData() == "all" or row.get("category") == self.category_filter.currentData()
+        supplier_ok = self.supplier_filter.currentData() == "all" or row.get("supplier") == self.supplier_filter.currentData()
+        stock_ok = self.stock_filter.currentData() == "all" or stock_key == self.stock_filter.currentData()
+        return category_ok and supplier_ok and stock_ok and _contains(
+            row,
+            ["medicine_code", "name", "active_ingredient", "category", "supplier", "description"],
+            self.search_input.text(),
+        )
+
+    def stat_cards(self):
+        available = sum(1 for row in self.rows if self._stock_state(row)[0] == "available" and _is_active(row))
+        low = sum(1 for row in self.rows if self._stock_state(row)[0] == "low" and _is_active(row))
+        empty = sum(1 for row in self.rows if self._stock_state(row)[0] == "empty" and _is_active(row))
+        return [
+            self._stat_card("💊", "Tổng số thuốc", len([r for r in self.rows if _is_active(r)]), "Dữ liệu theo DB hiện tại", "#2563eb"),
+            self._stat_card("🧰", "Thuốc còn hàng", available, "Dữ liệu theo DB hiện tại", "#00a651"),
+            self._stat_card("⚠", "Thuốc sắp hết", low, "Dữ liệu theo DB hiện tại", "#f97316"),
+            self._stat_card("⛔", "Thuốc hết hàng", empty, "Dữ liệu theo DB hiện tại", "#8b5cf6"),
+        ]
+
+    def render_row(self, row, data):
+        _, label = self._stock_state(data)
+        self._set_item(row, 0, "☐")
+        self._set_item(row, 1, row + 1)
+        self._set_item(row, 2, data.get("name"))
+        self._set_item(row, 3, data.get("active_ingredient") or data.get("description"))
+        self._set_item(row, 4, data.get("category"))
+        self._set_item(row, 5, data.get("unit") or "Viên")
+        self._set_item(row, 6, data.get("supplier") or "Chưa rõ")
+        self._set_item(row, 7, f"{_as_int(data.get('quantity')):,}".replace(",", "."))
+        self._set_item(row, 8, _format_money(data.get("import_price") or _as_float(data.get("price")) * 0.7))
+        self._set_item(row, 9, _format_money(data.get("price")))
+        self.table.setCellWidget(row, 10, self._badge(label if _is_active(data) else "Ngưng hoạt động"))
+        view_btn = self._icon_button("Xem", "info")
+        edit_btn = self._icon_button("Sửa", "info")
+        del_btn = self._icon_button("Xóa", "danger")
+        view_btn.clicked.connect(lambda _, item=data: self.view_detail(item))
+        edit_btn.clicked.connect(lambda _, item=data: self.edit_medicine(item))
+        del_btn.clicked.connect(lambda _, item=data: self.soft_delete(item))
+        self.table.setCellWidget(row, 11, self._action_cell([view_btn, edit_btn, del_btn]))
+
+    def _medicine_fields(self):
+        return [
+            {"key": "medicine_code", "label": "Mã thuốc"},
+            {"key": "name", "label": "Tên thuốc"},
+            {"key": "active_ingredient", "label": "Hoạt chất"},
+            {"key": "category", "label": "Danh mục"},
+            {"key": "unit", "label": "Đơn vị"},
+            {"key": "supplier", "label": "Nhà cung cấp"},
+            {"key": "quantity", "label": "Số lượng", "type": "spin", "max": 1000000},
+            {"key": "import_price", "label": "Giá nhập", "type": "money"},
+            {"key": "price", "label": "Giá", "type": "money"},
+            {"key": "description", "label": "Mô tả"},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Ngưng", 0)]},
+        ]
+
+    def add_medicine(self):
+        dialog = FormDialog("Thêm thuốc", self._medicine_fields(), {"is_active": 1, "unit": "Viên"}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        data = dialog.values()
+        ok = _safe_execute(
+            """
+            INSERT INTO Medicines
+            (medicine_code, name, active_ingredient, category, unit, supplier, quantity, import_price, price, description, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["medicine_code"],
+                data["name"],
+                data["active_ingredient"],
+                data["category"],
+                data["unit"],
+                data["supplier"],
+                data["quantity"],
+                data["import_price"],
+                data["price"],
+                data["description"],
+                data["is_active"],
+            ),
+        )
+        self._show_info("Thuốc", "Đã thêm thuốc." if ok else "Không thể thêm thuốc.")
+        self.refresh()
+
+    def edit_medicine(self, item):
+        data = dict(item)
+        data["is_active"] = 1 if _is_active(item) else 0
+        dialog = FormDialog("Sửa thuốc", self._medicine_fields(), data, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        ok = _safe_execute(
+            """
+            UPDATE Medicines
+            SET medicine_code=?, name=?, active_ingredient=?, category=?, unit=?, supplier=?,
+                quantity=?, import_price=?, price=?, description=?, is_active=?
+            WHERE medicine_id=?
+            """,
+            (
+                values["medicine_code"],
+                values["name"],
+                values["active_ingredient"],
+                values["category"],
+                values["unit"],
+                values["supplier"],
+                values["quantity"],
+                values["import_price"],
+                values["price"],
+                values["description"],
+                values["is_active"],
+                item.get("medicine_id"),
+            ),
+        )
+        self._show_info("Thuốc", "Đã cập nhật thuốc." if ok else "Không thể cập nhật thuốc.")
+        self.refresh()
+
+    def soft_delete(self, item):
+        if not self._confirm("Xóa thuốc", "Thuốc sẽ được ngưng hoạt động thay vì xóa cứng. Tiếp tục?"):
+            return
+        ok = _safe_execute("UPDATE Medicines SET is_active=0 WHERE medicine_id=?", (item.get("medicine_id"),))
+        self._show_info("Thuốc", "Đã ngưng hoạt động thuốc." if ok else "Không thể cập nhật thuốc.")
+        self.refresh()
+
+    def view_detail(self, item):
+        self._show_info(
+            "Chi tiết thuốc",
+            f"{item.get('name')}\nHoạt chất: {item.get('active_ingredient') or item.get('description')}\n"
+            f"Danh mục: {item.get('category') or 'Chưa có'}\nNhà cung cấp: {item.get('supplier') or 'Chưa rõ'}\n"
+            f"Tồn kho: {item.get('quantity')}\nGiá bán: {_format_money(item.get('price'))}",
+        )
+
+    def export_row(self, row):
+        return [
+            row.get("medicine_code") or row.get("medicine_id"),
+            row.get("name"),
+            row.get("active_ingredient") or row.get("description"),
+            row.get("category"),
+            row.get("unit"),
+            row.get("supplier"),
+            row.get("quantity"),
+            row.get("import_price"),
+            row.get("price"),
+            self._stock_state(row)[1],
+        ]
+
+
+
+class PaymentManagementPage(AdminListPage):
+    page_title = "Quản lý thanh toán"
+    breadcrumb = "Dashboard / Quản lý thanh toán"
+    headers = ["☐", "STT", "Mã giao dịch", "Bệnh nhân", "Dịch vụ/Thuốc", "Phương thức", "Số tiền", "Ngày thanh toán", "Trạng thái", "Thao tác"]
+    export_headers = ["Mã giao dịch", "Bệnh nhân", "Dịch vụ/Thuốc", "Số tiền", "Phương thức", "Trạng thái", "Ngày thanh toán"]
+    column_widths = [0.35, 0.45, 1.35, 1.45, 1.45, 1.05, 0.95, 1.35, 1.1, 0.9]
+    search_placeholder = "Tìm kiếm (Mã giao dịch, tên bệnh nhân, dịch vụ...)"
+    search_min_width = 180
+    search_max_width = 260
+    filter_combo_width = 128
+
+    def _build_list_page(self):
+        super()._build_list_page()
+        self.table_card = self.table.parentWidget()
+
+        self.empty_card = self._card()
+        empty_layout = QtWidgets.QVBoxLayout(self.empty_card)
+        empty_layout.setContentsMargins(24, 24, 24, 24)
+        empty_layout.setSpacing(10)
+        empty_icon = QtWidgets.QLabel("📭")
+        empty_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        empty_icon.setStyleSheet("font-size: 34px;")
+        self.empty_label = QtWidgets.QLabel("Chưa có thanh toán nào\nKhông tìm thấy giao dịch phù hợp với bộ lọc hiện tại.")
+        self.empty_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet("font-size: 14px; font-weight: 800; color: #475569;")
+
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.addStretch()
+        add_btn = self._button("+ Thêm thanh toán", primary=True)
+        add_btn.clicked.connect(self.add_payment)
+        action_row.addWidget(add_btn)
+        action_row.addStretch()
+
+        empty_layout.addWidget(empty_icon)
+        empty_layout.addWidget(self.empty_label)
+        empty_layout.addLayout(action_row)
+
+        self.content_layout.insertWidget(2, self.empty_card)
+        self.empty_card.hide()
+
+    def _render_table(self):
+        super()._render_table()
+        if not hasattr(self, "empty_card"):
+            return
+        if len(self.filtered_rows) == 0:
+            self.empty_card.show()
+            self.table_card.hide()
+        else:
+            self.empty_card.hide()
+            self.table_card.show()
+
+    def _add_filters(self, layout):
+        today = date.today()
+        self.from_date_filter = QtWidgets.QDateEdit(QtCore.QDate(today.year, today.month, 1))
+        self.to_date_filter = QtWidgets.QDateEdit(QtCore.QDate(today.year, today.month, today.day))
+        for date_filter in [self.from_date_filter, self.to_date_filter]:
+            date_filter.setCalendarPopup(True)
+            date_filter.setDisplayFormat("dd/MM/yyyy")
+            date_filter.setMinimumHeight(38)
+            date_filter.setFixedWidth(120)
+            date_filter.setStyleSheet(FormDialog._input_style())
+            date_filter.dateChanged.connect(self._reset_and_refresh)
+        self.method_filter = self._combo([("Tất cả", "all"), ("Tiền mặt", "Tiền mặt"), ("Chuyển khoản", "Chuyển khoản"), ("Thẻ ngân hàng", "Thẻ ngân hàng"), ("Ví điện tử", "Ví điện tử")])
+        self.status_filter = self._combo([("Tất cả", "all"), ("Thành công", "paid"), ("Đang chờ", "unpaid"), ("Thất bại", "failed"), ("Hoàn tiền", "refunded"), ("Đã hủy", "cancelled")])
+        layout.addWidget(self._filter_field("Từ ngày", self.from_date_filter))
+        layout.addWidget(self._filter_field("Đến ngày", self.to_date_filter))
+        layout.addWidget(self._filter_field("Phương thức", self.method_filter))
+        layout.addWidget(self._filter_field("Trạng thái", self.status_filter))
+
+    def _add_toolbar_buttons(self, layout):
+        add_btn = self._button("Thêm thanh toán", primary=True)
+        add_btn.setFixedWidth(130)
+        add_btn.clicked.connect(self.add_payment)
+        layout.addWidget(add_btn)
+        super()._add_toolbar_buttons(layout)
+
+    def load_rows(self):
+        try:
+            from controllers.payment_controller import PaymentController
+
+            rows = PaymentController.get_enriched_all() or []
+            for row in rows:
+                row["service_name"] = row.get("service_names") or row.get("service_name")
+            return rows
+        except Exception:
+            return []
+
+    def accept_row(self, row):
+        parsed = _parse_date(row.get("payment_date"))
+        from_qdate = self.from_date_filter.date()
+        to_qdate = self.to_date_filter.date()
+        start = date(from_qdate.year(), from_qdate.month(), from_qdate.day())
+        end = date(to_qdate.year(), to_qdate.month(), to_qdate.day())
+        date_ok = parsed is None or start <= parsed <= end
+        method_ok = self.method_filter.currentData() == "all" or row.get("method") == self.method_filter.currentData()
+        status_ok = self.status_filter.currentData() == "all" or row.get("status") == self.status_filter.currentData()
+        return date_ok and method_ok and status_ok and _contains(
+            row,
+            ["payment_id", "patient_code", "patient_name", "service_name", "method", "appointment_id", "status"],
+            self.search_input.text(),
+        )
+
+    def stat_cards(self):
+        total = sum(_as_float(row.get("total_amount")) for row in self.rows)
+        paid = sum(_as_float(row.get("total_amount")) for row in self.rows if row.get("status") == "paid")
+        unpaid = sum(_as_float(row.get("total_amount")) for row in self.rows if row.get("status") == "unpaid")
+        failed = sum(_as_float(row.get("total_amount")) for row in self.rows if row.get("status") == "failed")
+        return [
+            self._stat_card("💳", "Tổng thanh toán", _format_money(total), "Dữ liệu theo DB hiện tại", "#2563eb"),
+            self._stat_card("✅", "Thanh toán thành công", _format_money(paid), "Dữ liệu theo DB hiện tại", "#00a651"),
+            self._stat_card("⏳", "Đang chờ thanh toán", _format_money(unpaid), "Dữ liệu theo DB hiện tại", "#f97316"),
+            self._stat_card("✕", "Thanh toán thất bại", _format_money(failed), "Dữ liệu theo DB hiện tại", "#8b5cf6"),
+        ]
+
+    def _payment_status_text(self, status):
+        return {
+            "paid": "Thành công",
+            "unpaid": "Đang chờ",
+            "failed": "Thất bại",
+            "refunded": "Hoàn tiền",
+            "cancelled": "Đã hủy",
+        }.get(status, _as_text(status, "Đang chờ"))
+
+    def _method_kind(self, method):
+        return {"Tiền mặt": "success", "Chuyển khoản": "info", "Thẻ ngân hàng": "neutral", "Ví điện tử": "warning"}.get(method, "neutral")
+
+    def render_row(self, row, data):
+        self._set_item(row, 0, "☐")
+        self._set_item(row, 1, row + 1)
+
+        parsed_date = _parse_date(data.get("payment_date"))
+        date_prefix = parsed_date.strftime("%d%m%y") if parsed_date else "000000"
+        tx_code = f"GD{date_prefix}-{_as_int(data.get('payment_id')):04d}"
+
+        self._set_item(row, 2, tx_code)
+        patient_code = data.get("patient_code") or f"BN{_as_int(data.get('patient_id')):03d}"
+        self._set_item(row, 3, f"👤 {data.get('patient_name') or 'Bệnh nhân'}\n{patient_code}")
+        self._set_item(row, 4, data.get("service_name") or f"Lịch hẹn #{data.get('appointment_id')}")
+        self.table.setCellWidget(row, 5, self._badge(data.get("method") or "Tiền mặt", self._method_kind(data.get("method"))))
+        self._set_item(row, 6, _format_money(data.get("total_amount")))
+        self._set_item(row, 7, _format_datetime(data.get("payment_date")))
+        self.table.setCellWidget(row, 8, self._badge(self._payment_status_text(data.get("status"))))
+        view_btn = self._icon_button("Xem", "info")
+        print_btn = self._icon_button("In", "info")
+        status_btn = self._icon_button("•••", "success")
+        view_btn.clicked.connect(lambda _, item=data: self.view_detail(item))
+        print_btn.clicked.connect(lambda _, item=data: self.print_invoice(item))
+        status_btn.clicked.connect(lambda _, item=data: self.toggle_status(item))
+        self.table.setCellWidget(row, 9, self._action_cell([view_btn, print_btn, status_btn]))
+
+    def add_payment(self):
+        patients = _safe_fetch_all("SELECT patient_id, name FROM Patients ORDER BY name")
+        patient_opts = [(f"{p.get('name')} (ID: {p.get('patient_id')})", p.get("patient_id")) for p in patients] if patients else [("Không có bệnh nhân", 0)]
+
+        appointments = _safe_fetch_all(
+            "SELECT TOP 100 appointment_id, appointment_date FROM Appointments ORDER BY appointment_date DESC"
+            if DB_TYPE != "mysql"
+            else "SELECT appointment_id, appointment_date FROM Appointments ORDER BY appointment_date DESC LIMIT 100"
+        )
+        appt_opts = [(f"Lịch hẹn #{a.get('appointment_id')} ({_format_date(a.get('appointment_date'))})", a.get("appointment_id")) for a in appointments] if appointments else [("Không có lịch hẹn", 0)]
+
+        fields = [
+            {"key": "patient_id", "label": "Bệnh nhân", "type": "combo", "options": patient_opts},
+            {"key": "appointment_id", "label": "Lịch hẹn/Dịch vụ", "type": "combo", "options": appt_opts},
+            {"key": "method", "label": "Phương thức", "type": "combo", "options": [("Tiền mặt", "Tiền mặt"), ("Chuyển khoản", "Chuyển khoản"), ("Thẻ ngân hàng", "Thẻ ngân hàng"), ("Ví điện tử", "Ví điện tử")]},
+            {"key": "total_amount", "label": "Số tiền", "type": "money"},
+            {"key": "status", "label": "Trạng thái", "type": "combo", "options": [("Thành công", "paid"), ("Đang chờ", "unpaid"), ("Thất bại", "failed"), ("Hoàn tiền", "refunded"), ("Đã hủy", "cancelled")]},
+        ]
+        dialog = FormDialog("Thêm thanh toán", fields, {"status": "unpaid", "method": "Tiền mặt"}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        data = dialog.values()
+
+        if data["patient_id"] == 0:
+            self._show_info("Lỗi", "Vui lòng chọn bệnh nhân hợp lệ.")
+            return
+
+        ok = _safe_execute(
+            "INSERT INTO Payments (patient_id, appointment_id, total_amount, method, status) VALUES (?, ?, ?, ?, ?)",
+            (data["patient_id"], data["appointment_id"], data["total_amount"], data["method"], data["status"]),
+        )
+        self._show_info("Thanh toán", "Đã thêm thanh toán." if ok else "Không thể thêm thanh toán.")
+        self.refresh()
+
+    def view_detail(self, item):
+        parsed_date = _parse_date(item.get("payment_date"))
+        date_prefix = parsed_date.strftime("%d%m%y") if parsed_date else "000000"
+        tx_code = f"GD{date_prefix}-{_as_int(item.get('payment_id')):04d}"
+
+        self._show_info(
+            "Chi tiết thanh toán",
+            f"Mã giao dịch: {tx_code}\nBệnh nhân: {item.get('patient_name')}\nDịch vụ/thuốc: {item.get('service_name') or 'Chưa có'}\n"
+            f"Phương thức: {item.get('method') or 'Tiền mặt'}\nSố tiền: {_format_money(item.get('total_amount'))}\n"
+            f"Trạng thái: {self._payment_status_text(item.get('status'))}\nNgày thanh toán: {_format_datetime(item.get('payment_date'))}",
+        )
+
+    def print_invoice(self, item):
+        parsed_date = _parse_date(item.get("payment_date"))
+        date_prefix = parsed_date.strftime("%d%m%y") if parsed_date else "000000"
+        tx_code = f"GD{date_prefix}-{_as_int(item.get('payment_id')):04d}"
+
+        self._show_info("In hóa đơn", f"Mã giao dịch: {tx_code}\nHóa đơn #{item.get('payment_id')}\nBệnh nhân: {item.get('patient_name')}\nDịch vụ/thuốc: {item.get('service_name') or 'Chưa có'}\nTổng tiền: {_format_money(item.get('total_amount'))}")
+
+    def toggle_status(self, item):
+        fields = [
+            {"key": "status", "label": "Cập nhật trạng thái", "type": "combo", "options": [("Thành công", "paid"), ("Đang chờ", "unpaid"), ("Thất bại", "failed"), ("Hoàn tiền", "refunded"), ("Đã hủy", "cancelled")]}
+        ]
+        dialog = FormDialog("Cập nhật trạng thái", fields, {"status": item.get("status")}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        new_status = dialog.values()["status"]
+        if new_status == item.get("status"):
+            return
+
+        ok = _safe_execute("UPDATE Payments SET status=? WHERE payment_id=?", (new_status, item.get("payment_id")))
+        self._show_info("Thanh toán", "Đã cập nhật trạng thái." if ok else "Không thể cập nhật trạng thái.")
+        self.refresh()
+
+    def export_row(self, row):
+        parsed_date = _parse_date(row.get("payment_date"))
+        date_prefix = parsed_date.strftime("%d%m%y") if parsed_date else "000000"
+        tx_code = f"GD{date_prefix}-{_as_int(row.get('payment_id')):04d}"
+
+        return [
+            tx_code,
+            row.get("patient_name"),
+            row.get("service_name") or row.get("appointment_id"),
+            _format_money(row.get("total_amount")),
+            row.get("method"),
+            self._payment_status_text(row.get("status")),
+            _format_datetime(row.get("payment_date")),
+        ]
+
+
+class ReportStatsPage(AdminBasePage):
+    page_title = "Xem báo cáo thống kê"
+    breadcrumb = "Dashboard / Xem báo cáo thống kê"
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(user_data, parent)
+        self._report_payload = {}
+        self._status_label = None
+        self._last_error = ""
+        self._filter_button = None
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        self.stats_row = QtWidgets.QHBoxLayout()
+        self.stats_row.setSpacing(12)
+        self.content_layout.addLayout(self.stats_row)
+
+        filter_card = self._card()
+        row = QtWidgets.QHBoxLayout(filter_card)
+        row.setContentsMargins(16, 10, 16, 10)
+        row.setSpacing(10)
+
+        options = ReportController.get_filter_options()
+        ranges = options.get("ranges", [])
+        report_types = options.get("report_types", [])
+        groups = options.get("groups", [])
+        doctors = options.get("doctors", [])
+
+        self.range_combo = QtWidgets.QComboBox()
+        for item in ranges:
+            self.range_combo.addItem(_as_text(item.get("label"), "30 ngày qua"), _as_int(item.get("value"), 30))
+
+        self.report_type_combo = QtWidgets.QComboBox()
+        for label in report_types:
+            self.report_type_combo.addItem(label, label)
+        self.report_type_combo.setEnabled(False)
+        self.report_type_combo.setToolTip("Loại báo cáo nâng cao sẽ được mở ở phiên bản kế tiếp.")
+
+        self.group_combo = QtWidgets.QComboBox()
+        self.group_combo.addItem("Tất cả", "Tất cả")
+        for row_group in groups:
+            group_name = _as_text(row_group.get("category")).strip()
+            if group_name:
+                self.group_combo.addItem(group_name, group_name)
+
+        self.doctor_combo = QtWidgets.QComboBox()
+        self.doctor_combo.addItem("Tất cả", "Tất cả")
+        for row_doctor in doctors:
+            doctor_name = _as_text(row_doctor.get("name")).strip()
+            if doctor_name:
+                self.doctor_combo.addItem(f"BS. {doctor_name}", doctor_name)
+
+        for combo, width in [
+            (self.range_combo, 200),
+            (self.report_type_combo, 142),
+            (self.group_combo, 142),
+            (self.doctor_combo, 142),
+        ]:
+            combo.setFixedWidth(width)
+            combo.setMinimumHeight(38)
+            combo.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            combo.setStyleSheet(FormDialog._input_style())
+            combo.currentIndexChanged.connect(self.refresh)
+        row.addWidget(self._filter_field("Khoảng thời gian", self.range_combo))
+        row.addWidget(self._filter_field("Loại báo cáo", self.report_type_combo))
+        row.addWidget(self._filter_field("Nhóm", self.group_combo))
+        row.addWidget(self._filter_field("Bác sĩ", self.doctor_combo))
+        row.addStretch()
+        self._filter_button = self._button("Lọc báo cáo", primary=True)
+        self._filter_button.setFixedWidth(112)
+        self._filter_button.clicked.connect(self.refresh)
+        row.addWidget(self._filter_button)
+        export_btn = self._button("Xuất Excel")
+        export_btn.setFixedWidth(106)
+        export_btn.clicked.connect(self.export_csv)
+        row.addWidget(export_btn)
+        self.content_layout.addWidget(filter_card)
+
+        charts = QtWidgets.QHBoxLayout()
+        charts.setSpacing(16)
+        revenue_card = self._card()
+        revenue_layout = QtWidgets.QVBoxLayout(revenue_card)
+        revenue_layout.setContentsMargins(18, 18, 18, 18)
+        revenue_layout.addWidget(self._section_title("Doanh thu theo ngày"))
+        self.revenue_chart = LineChartWidget(color="#2563eb")
+        self.revenue_chart.setFixedHeight(190)
+        revenue_layout.addWidget(self.revenue_chart)
+        charts.addWidget(revenue_card, 2)
+
+        method_card = self._card()
+        method_layout = QtWidgets.QVBoxLayout(method_card)
+        method_layout.setContentsMargins(18, 18, 18, 18)
+        method_layout.addWidget(self._section_title("Doanh thu theo phương thức thanh toán"))
+        self.method_chart = DonutChartWidget()
+        self.method_chart.setFixedHeight(190)
+        method_layout.addWidget(self.method_chart)
+        charts.addWidget(method_card, 1)
+        self.content_layout.addLayout(charts)
+
+        bottom = QtWidgets.QHBoxLayout()
+        bottom.setSpacing(16)
+        self.top_services_card = self._card()
+        self.patient_stats_card = self._card()
+        self.payment_status_card = self._card()
+        bottom.addWidget(self.top_services_card)
+        bottom.addWidget(self.patient_stats_card)
+        bottom.addWidget(self.payment_status_card)
+        self.content_layout.addLayout(bottom)
+
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["Mã giao dịch", "Bệnh nhân", "Dịch vụ/Thuốc", "Số tiền", "Phương thức", "Trạng thái", "Ngày thanh toán"])
+        self._style_table(self.table, 12)
+        self.table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setMinimumHeight(42 + 3 * 38)
+        table_card = self._card()
+        table_layout = QtWidgets.QVBoxLayout(table_card)
+        table_layout.setContentsMargins(16, 16, 16, 16)
+        table_layout.addWidget(self._section_title("Chi tiết giao dịch gần đây"))
+        self._status_label = self._muted("")
+        table_layout.addWidget(self._status_label)
+        table_layout.addWidget(self.table)
+        self.content_layout.addWidget(table_card)
+
+    def _set_status_message(self, message):
+        if self._status_label is not None:
+            self._status_label.setText(_as_text(message))
+
+    def _set_filter_loading(self, loading):
+        if self._filter_button is None:
+            return
+        self._filter_button.setEnabled(not loading)
+        self._filter_button.setText("Đang lọc..." if loading else "Lọc báo cáo")
+
+    def _show_loading_state(self):
+        self._set_filter_loading(True)
+        self._set_status_message("Đang tải dữ liệu báo cáo...")
+
+    def _show_error_state(self, message):
+        self._set_filter_loading(False)
+        self._set_status_message(f"Không thể tải báo cáo. {message}")
+        self.revenue_chart.set_data([], [])
+        self.method_chart.set_items([])
+        self._fill_small_cards([], [], [], {
+            "patient_stats": {},
+            "payment_status": {},
+            "top_services": [],
+        })
+        self._fill_table([])
+
+    def _show_empty_state(self):
+        self._set_filter_loading(False)
+        self._set_status_message("Không có dữ liệu trong khoảng thời gian đã chọn")
+
+    def _report_filters(self):
+        return {
+            "range_days": self.range_combo.currentData(),
+            "group_name": self.group_combo.currentData() or "Tất cả",
+            "doctor_name": self.doctor_combo.currentData() or "Tất cả",
+        }
+
+    def _sync_doctor_filter(self):
+        current = self.doctor_combo.currentData() if hasattr(self, "doctor_combo") else "Tất cả"
+        doctors = _safe_fetch_all("SELECT name FROM Doctors WHERE COALESCE(is_active, 1)=1 ORDER BY name ASC")
+        self.doctor_combo.blockSignals(True)
+        self.doctor_combo.clear()
+        self.doctor_combo.addItem("Tất cả", "Tất cả")
+        for row in doctors:
+            name = _as_text(row.get("name")).strip()
+            if name:
+                self.doctor_combo.addItem(f"BS. {name}", name)
+        idx = self.doctor_combo.findData(current)
+        self.doctor_combo.setCurrentIndex(max(idx, 0))
+        self.doctor_combo.blockSignals(False)
+
+    def refresh(self):
+        self._show_loading_state()
+
+        filters = self._report_filters()
+        try:
+            payload = ReportController.get_report_stats(**filters)
+            self._report_payload = payload
+            self._last_error = ""
+        except Exception as exc:
+            self._last_error = _as_text(exc, "Lỗi không xác định")
+            self._show_error_state(self._last_error)
+            return
+
+        self._set_filter_loading(False)
+
+        summary = self._report_payload.get("summary", {})
+        total_revenue = _as_float(summary.get("total_revenue"))
+        total_paid = _as_float(summary.get("total_paid"))
+        total_patients = _as_int(summary.get("total_patients"))
+        total_services = _as_int(summary.get("total_services"))
+
+        while self.stats_row.count():
+            item = self.stats_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for card in [
+            self._stat_card("💵", "Tổng doanh thu", _format_money(total_revenue), "Dữ liệu động từ DB", "#2563eb"),
+            self._stat_card("✅", "Tổng thanh toán", _format_money(total_paid), "Dữ liệu động từ DB", "#00a651"),
+            self._stat_card("👥", "Tổng bệnh nhân", total_patients, "Dữ liệu động từ DB", "#f97316"),
+            self._stat_card("🧾", "Tổng dịch vụ", total_services, "Dữ liệu động từ DB", "#8b5cf6"),
+        ]:
+            self.stats_row.addWidget(card)
+
+        daily_rows = self._report_payload.get("daily_revenue", [])
+        daily_labels = [_as_text(row.get("label")) for row in daily_rows]
+        daily_values = [_as_float(row.get("amount_million")) for row in daily_rows]
+        self.revenue_chart.set_data(daily_labels, daily_values)
+
+        method_rows = self._report_payload.get("payment_methods", [])
+        method_items = [(_as_text(row.get("method")), _as_float(row.get("amount"))) for row in method_rows]
+        self.method_chart.set_items(method_items)
+
+        self._fill_small_cards(
+            self._report_payload.get("recent_transactions", []),
+            [],
+            [],
+            self._report_payload,
+        )
+        self._fill_table(self._report_payload.get("recent_transactions", []))
+
+        if not self._report_payload.get("recent_transactions"):
+            self._show_empty_state()
+        else:
+            self._set_status_message("Dữ liệu đã được cập nhật theo bộ lọc.")
+
+    def _fill_small_cards(self, payments, patients, services, payload):
+        for card in [self.top_services_card, self.patient_stats_card, self.payment_status_card]:
+            layout = card.layout()
+            if layout:
+                while layout.count():
+                    item = layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            else:
+                layout = QtWidgets.QVBoxLayout(card)
+                layout.setContentsMargins(18, 18, 18, 18)
+
+        self.top_services_card.layout().addWidget(self._section_title("Top dịch vụ có doanh thu cao"))
+        ranking = payload.get("top_services", [])
+        if ranking:
+            for item in ranking:
+                self.top_services_card.layout().addWidget(
+                    self._muted(
+                        f"{_as_int(item.get('rank'))}. {_as_text(item.get('name'))} - {_format_money(item.get('revenue'))} - {_as_int(item.get('count'))} lượt"
+                    )
+                )
+        else:
+            self.top_services_card.layout().addWidget(self._muted("Chưa có dữ liệu"))
+
+        self.patient_stats_card.layout().addWidget(self._section_title("Thống kê bệnh nhân"))
+        patient_stats = payload.get("patient_stats", {})
+        patient_lines = [
+            ("Tổng bệnh nhân", str(_as_int(patient_stats.get("total")))),
+            ("Bệnh nhân mới", str(_as_int(patient_stats.get("new")))),
+            ("Bệnh nhân tái khám", str(_as_int(patient_stats.get("returning")))),
+            ("Nam", str(_as_int(patient_stats.get("male")))),
+            ("Nữ", str(_as_int(patient_stats.get("female")))),
+        ]
+        for label, value in patient_lines:
+            self.patient_stats_card.layout().addWidget(self._muted(f"{label}: {value}"))
+
+        self.payment_status_card.layout().addWidget(self._section_title("Tình trạng thanh toán"))
+        status_payload = payload.get("payment_status", {})
+        status_lines = [
+            (f"Thành công: {_as_int(status_payload.get('paid'))}", "success"),
+            (f"Đang chờ: {_as_int(status_payload.get('unpaid'))}", "warning"),
+            (f"Thất bại: {_as_int(status_payload.get('failed'))}", "danger"),
+            (f"Khác: {_as_int(status_payload.get('other'))}", "neutral"),
+        ]
+        for text, kind in status_lines:
+            self.payment_status_card.layout().addWidget(self._badge(text, kind))
+
+    def _fill_table(self, payments):
+        self.table.setRowCount(len(payments))
+        for row, item in enumerate(payments):
+            parsed_date = _parse_date(item.get("payment_date"))
+            date_prefix = parsed_date.strftime("%d%m%y") if parsed_date else "000000"
+            tx_code = f"GD{date_prefix}-{_as_int(item.get('payment_id')):04d}"
+            for column, value in enumerate([
+                tx_code,
+                item.get("patient_name"),
+                item.get("service_name") or item.get("appointment_id"),
+                _format_money(item.get("total_amount")),
+                item.get("method") or "Tiền mặt",
+                {"paid": "Thành công", "unpaid": "Đang chờ", "failed": "Thất bại"}.get(item.get("status"), item.get("status")),
+                _format_datetime(item.get("payment_date")),
+            ]):
+                self.table.setItem(row, column, QtWidgets.QTableWidgetItem(_as_text(value)))
+            self.table.setRowHeight(row, 38)
+
+    def export_csv(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Xuất báo cáo", "bao_cao_thong_ke.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        payments = self._report_payload.get("recent_transactions", [])
+        with open(path, "w", newline="", encoding="utf-8-sig") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(["payment_id", "patient_name", "service_name", "total_amount", "method", "payment_date", "status"])
+            for row in payments:
+                writer.writerow([row.get("payment_id"), row.get("patient_name"), row.get("service_name"), row.get("total_amount"), row.get("method"), row.get("payment_date"), row.get("status")])
+        self._show_info("Xuất báo cáo", "Đã xuất báo cáo theo bộ lọc.")
+
+
+class RolePermissionPage(AdminBasePage):
+    page_title = "Phân quyền hệ thống"
+    breadcrumb = "Dashboard / Phân quyền hệ thống"
+    ROLE_ICONS = {
+        "admin": "⚙",
+        "doctor": "👨‍⚕️",
+        "receptionist": "👩‍💼",
+        "accountant": "💳",
+        "nurse": "💉",
+        "staff": "👥",
+        "patient": "🧑",
+    }
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(user_data, parent)
+        self.selected_role = ""
+        self.selected_role_id = None
+        self.role_rows = []
+        self.permission_rows = []
+        self.permission_groups = []
+        self.role_permission_map = {}
+        self._build()
+        self.refresh()
+
+    def _ensure_rbac_schema(self):
+        if DB_TYPE != "mysql":
+            statements = [
+                """
+                IF OBJECT_ID('dbo.rbac_roles', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_roles (
+                        role_id INT IDENTITY(1,1) PRIMARY KEY,
+                        role_key NVARCHAR(50) NOT NULL UNIQUE,
+                        display_name NVARCHAR(100) NOT NULL,
+                        description NVARCHAR(255) NULL,
+                        color_kind NVARCHAR(20) DEFAULT N'neutral',
+                        is_system BIT DEFAULT 0,
+                        is_active BIT DEFAULT 1,
+                        created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+                        updated_at DATETIME2 DEFAULT SYSUTCDATETIME()
+                    )
+                END
+                """,
+                """
+                IF OBJECT_ID('dbo.rbac_permission_groups', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_permission_groups (
+                        group_id INT IDENTITY(1,1) PRIMARY KEY,
+                        group_key NVARCHAR(100) NOT NULL UNIQUE,
+                        display_name NVARCHAR(150) NOT NULL,
+                        description NVARCHAR(255) NULL,
+                        sort_order INT DEFAULT 0,
+                        is_active BIT DEFAULT 1,
+                        created_at DATETIME2 DEFAULT SYSUTCDATETIME()
+                    )
+                END
+                """,
+                """
+                IF OBJECT_ID('dbo.rbac_permissions', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_permissions (
+                        permission_id INT IDENTITY(1,1) PRIMARY KEY,
+                        group_id INT NOT NULL,
+                        permission_key NVARCHAR(120) NOT NULL UNIQUE,
+                        display_name NVARCHAR(150) NOT NULL,
+                        description NVARCHAR(255) NULL,
+                        is_sensitive BIT DEFAULT 0,
+                        is_active BIT DEFAULT 1,
+                        created_at DATETIME2 DEFAULT SYSUTCDATETIME()
+                    )
+                END
+                """,
+                """
+                IF OBJECT_ID('dbo.rbac_role_permissions', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_role_permissions (
+                        role_id INT NOT NULL,
+                        permission_id INT NOT NULL,
+                        allowed BIT DEFAULT 1,
+                        granted_by_user_id INT NULL,
+                        granted_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+                        PRIMARY KEY (role_id, permission_id)
+                    )
+                END
+                """,
+                """
+                IF OBJECT_ID('dbo.rbac_user_role_assignments', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_user_role_assignments (
+                        assignment_id INT IDENTITY(1,1) PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        role_id INT NOT NULL,
+                        assigned_by_user_id INT NULL,
+                        assigned_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+                        is_active BIT DEFAULT 1,
+                        CONSTRAINT uq_rbac_user_role_active UNIQUE (user_id, role_id)
+                    )
+                END
+                """,
+                """
+                IF OBJECT_ID('dbo.rbac_audit_logs', 'U') IS NULL
+                BEGIN
+                    CREATE TABLE dbo.rbac_audit_logs (
+                        audit_id INT IDENTITY(1,1) PRIMARY KEY,
+                        actor_user_id INT NULL,
+                        action_key NVARCHAR(100) NOT NULL,
+                        target_type NVARCHAR(50) NOT NULL,
+                        target_id NVARCHAR(100) NOT NULL,
+                        details NVARCHAR(MAX) NULL,
+                        created_at DATETIME2 DEFAULT SYSUTCDATETIME()
+                    )
+                END
+                """,
+            ]
+            for stmt in statements:
+                _safe_execute(stmt)
+            return
+
+        statements = [
+            """
+            CREATE TABLE IF NOT EXISTS rbac_roles (
+                role_id INT AUTO_INCREMENT PRIMARY KEY,
+                role_key VARCHAR(50) NOT NULL,
+                display_name VARCHAR(100) NOT NULL,
+                description VARCHAR(255),
+                color_kind VARCHAR(20) DEFAULT 'neutral',
+                is_system BOOLEAN DEFAULT FALSE,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_rbac_roles_key (role_key)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rbac_permission_groups (
+                group_id INT AUTO_INCREMENT PRIMARY KEY,
+                group_key VARCHAR(100) NOT NULL,
+                display_name VARCHAR(150) NOT NULL,
+                description VARCHAR(255),
+                sort_order INT DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_rbac_permission_groups_key (group_key)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rbac_permissions (
+                permission_id INT AUTO_INCREMENT PRIMARY KEY,
+                group_id INT NOT NULL,
+                permission_key VARCHAR(120) NOT NULL,
+                display_name VARCHAR(150) NOT NULL,
+                description VARCHAR(255),
+                is_sensitive BOOLEAN DEFAULT FALSE,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (group_id) REFERENCES rbac_permission_groups(group_id),
+                UNIQUE KEY uq_rbac_permissions_key (permission_key)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rbac_role_permissions (
+                role_id INT NOT NULL,
+                permission_id INT NOT NULL,
+                allowed BOOLEAN DEFAULT TRUE,
+                granted_by_user_id INT NULL,
+                granted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (role_id, permission_id),
+                FOREIGN KEY (role_id) REFERENCES rbac_roles(role_id),
+                FOREIGN KEY (permission_id) REFERENCES rbac_permissions(permission_id),
+                FOREIGN KEY (granted_by_user_id) REFERENCES Users(user_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rbac_user_role_assignments (
+                assignment_id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                role_id INT NOT NULL,
+                assigned_by_user_id INT NULL,
+                assigned_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE,
+                UNIQUE KEY uq_rbac_user_role_active (user_id, role_id),
+                FOREIGN KEY (user_id) REFERENCES Users(user_id),
+                FOREIGN KEY (role_id) REFERENCES rbac_roles(role_id),
+                FOREIGN KEY (assigned_by_user_id) REFERENCES Users(user_id)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS rbac_audit_logs (
+                audit_id INT AUTO_INCREMENT PRIMARY KEY,
+                actor_user_id INT NULL,
+                action_key VARCHAR(100) NOT NULL,
+                target_type VARCHAR(50) NOT NULL,
+                target_id VARCHAR(100) NOT NULL,
+                details TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (actor_user_id) REFERENCES Users(user_id)
+            )
+            """,
+        ]
+        for stmt in statements:
+            _safe_execute(stmt)
+
+    def _seed_rbac_defaults(self):
+        admin_user_subquery = (
+            "SELECT user_id FROM Users WHERE role='admin' ORDER BY user_id ASC LIMIT 1"
+            if DB_TYPE == "mysql"
+            else "SELECT TOP 1 user_id FROM Users WHERE role='admin' ORDER BY user_id ASC"
+        )
+        role_seed = [
+            ("admin", "Quản trị viên", "Toàn quyền hệ thống", "success", 1, 1),
+            ("doctor", "Bác sĩ", "Quản lý chuyên môn", "info", 1, 1),
+            ("receptionist", "Lễ tân", "Quản lý tiếp đón và lịch hẹn", "warning", 0, 1),
+            ("accountant", "Kế toán", "Quản lý tài chính", "neutral", 0, 1),
+            ("nurse", "Điều dưỡng", "Hỗ trợ lâm sàng", "info", 0, 1),
+            ("staff", "Nhân viên", "Vận hành và hỗ trợ", "neutral", 1, 1),
+            ("patient", "Khách hàng", "Sử dụng dịch vụ khám", "warning", 1, 1),
+        ]
+        for role in role_seed:
+            _safe_execute(
+                """
+                INSERT INTO rbac_roles (role_key, display_name, description, color_kind, is_system, is_active)
+                SELECT ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (SELECT 1 FROM rbac_roles WHERE role_key=?)
+                """,
+                role + (role[0],),
+            )
+
+        group_seed = [
+            ("system", "Quản lý hệ thống", "Quản trị hệ thống", 10),
+            ("doctor", "Quản lý bác sĩ", "Quản lý dữ liệu bác sĩ", 20),
+            ("patient", "Quản lý bệnh nhân", "Quản lý hồ sơ bệnh nhân", 30),
+            ("medicine", "Quản lý thuốc", "Quản lý kho thuốc", 40),
+            ("service", "Quản lý dịch vụ", "Quản lý dịch vụ", 50),
+            ("payment", "Quản lý thanh toán", "Quản lý thanh toán", 60),
+            ("report", "Báo cáo thống kê", "Xem và xuất báo cáo", 70),
+            ("backup", "Sao lưu dữ liệu", "Sao lưu và khôi phục", 80),
+            ("account", "Quản lý tài khoản", "Quản lý tài khoản", 90),
+            ("rbac", "Quản lý phân quyền", "Quản lý vai trò và quyền", 100),
+        ]
+        for group in group_seed:
+            _safe_execute(
+                """
+                INSERT INTO rbac_permission_groups (group_key, display_name, description, sort_order, is_active)
+                SELECT ?, ?, ?, ?, 1
+                WHERE NOT EXISTS (SELECT 1 FROM rbac_permission_groups WHERE group_key=?)
+                """,
+                group + (group[0],),
+            )
+
+        permission_seed = [
+            ("system", "system.user.manage", "Quản lý người dùng", "Thêm, sửa, xóa người dùng", 1),
+            ("system", "system.permission.assign", "Phân quyền người dùng", "Cấp quyền cho người dùng", 1),
+            ("system", "system.role.manage", "Quản lý vai trò", "Quản lý vai trò hệ thống", 1),
+            ("system", "system.config.update", "Cấu hình hệ thống", "Cấu hình tham số hệ thống", 1),
+            ("system", "system.backup.execute", "Sao lưu dữ liệu", "Sao lưu và phục hồi dữ liệu", 1),
+            ("system", "system.audit.view", "Nhật ký hệ thống", "Xem nhật ký hoạt động", 1),
+            ("doctor", "doctor.view", "Xem danh sách bác sĩ", "Xem thông tin bác sĩ", 0),
+            ("doctor", "doctor.create", "Thêm bác sĩ", "Thêm bác sĩ mới", 0),
+            ("doctor", "doctor.update", "Sửa thông tin bác sĩ", "Cập nhật thông tin bác sĩ", 0),
+            ("doctor", "doctor.delete", "Xóa bác sĩ", "Xóa bác sĩ khỏi hệ thống", 1),
+            ("patient", "patient.view", "Xem danh sách bệnh nhân", "Xem thông tin bệnh nhân", 0),
+            ("patient", "patient.create", "Thêm bệnh nhân", "Thêm bệnh nhân mới", 0),
+            ("patient", "patient.update", "Sửa thông tin bệnh nhân", "Cập nhật thông tin bệnh nhân", 0),
+            ("patient", "patient.delete", "Xóa bệnh nhân", "Xóa bệnh nhân", 1),
+            ("patient", "patient.history.view", "Xem lịch sử khám", "Xem lịch sử khám bệnh", 0),
+            ("medicine", "medicine.view", "Xem danh sách thuốc", "Xem danh mục thuốc", 0),
+            ("medicine", "medicine.create", "Thêm thuốc", "Thêm thuốc mới", 0),
+            ("medicine", "medicine.update", "Sửa thông tin thuốc", "Sửa thông tin thuốc", 0),
+            ("medicine", "medicine.delete", "Xóa thuốc", "Xóa thuốc khỏi hệ thống", 1),
+            ("service", "service.view", "Xem danh sách dịch vụ", "Xem dịch vụ", 0),
+            ("service", "service.create", "Thêm dịch vụ", "Thêm dịch vụ", 0),
+            ("service", "service.update", "Sửa dịch vụ", "Sửa dịch vụ", 0),
+            ("payment", "payment.view", "Xem thanh toán", "Xem dữ liệu thanh toán", 0),
+            ("payment", "payment.update", "Cập nhật trạng thái thanh toán", "Cập nhật trạng thái thanh toán", 1),
+            ("report", "report.view", "Xem dashboard báo cáo", "Xem dashboard báo cáo", 0),
+            ("report", "report.export", "Xuất báo cáo", "Xuất báo cáo dữ liệu", 0),
+            ("backup", "backup.view", "Xem danh sách sao lưu", "Xem danh sách backup", 0),
+            ("backup", "backup.execute", "Tạo sao lưu", "Tạo bản sao lưu", 1),
+            ("backup", "backup.restore", "Khôi phục dữ liệu", "Khôi phục từ backup", 1),
+            ("account", "account.view", "Xem danh sách tài khoản", "Xem tài khoản hệ thống", 0),
+            ("account", "account.create", "Tạo tài khoản", "Tạo tài khoản", 1),
+            ("account", "account.update", "Sửa tài khoản", "Sửa thông tin tài khoản", 1),
+            ("account", "account.lock", "Khóa tài khoản", "Khóa tài khoản", 1),
+            ("rbac", "rbac.role.create", "Thêm vai trò", "Tạo vai trò mới", 1),
+            ("rbac", "rbac.role.update", "Sửa vai trò", "Sửa vai trò", 1),
+            ("rbac", "rbac.permission.assign", "Gán quyền", "Gán quyền cho vai trò", 1),
+            ("rbac", "rbac.permission.revoke", "Thu hồi quyền", "Thu hồi quyền từ vai trò", 1),
+        ]
+        for group_key, permission_key, display_name, description, sensitive in permission_seed:
+            _safe_execute(
+                """
+                INSERT INTO rbac_permissions (group_id, permission_key, display_name, description, is_sensitive, is_active)
+                SELECT g.group_id, ?, ?, ?, ?, 1
+                FROM rbac_permission_groups g
+                WHERE g.group_key=?
+                  AND NOT EXISTS (SELECT 1 FROM rbac_permissions WHERE permission_key=?)
+                """,
+                (permission_key, display_name, description, sensitive, group_key, permission_key),
+            )
+
+        _safe_execute(
+            f"""
+            INSERT INTO rbac_role_permissions (role_id, permission_id, allowed, granted_by_user_id)
+            SELECT r.role_id, p.permission_id, 1,
+                   ({admin_user_subquery})
+            FROM rbac_roles r
+            JOIN rbac_permissions p ON 1=1
+            WHERE r.role_key='admin'
+              AND NOT EXISTS (
+                  SELECT 1 FROM rbac_role_permissions rp
+                  WHERE rp.role_id=r.role_id AND rp.permission_id=p.permission_id
+              )
+            """
+        )
+
+        role_permission_packs = {
+            "doctor": ["doctor.", "patient.view", "patient.update", "patient.history.view", "report.view", "report.export"],
+            "receptionist": ["account.view", "account.update", "patient.view", "patient.create", "patient.update", "doctor.view", "service.view"],
+            "accountant": ["payment.", "report.view", "report.export", "backup.view"],
+            "nurse": ["patient.view", "patient.update", "doctor.view", "medicine.view", "service.view"],
+            "staff": ["patient.view", "patient.create", "patient.update", "doctor.view", "service.view", "payment.view"],
+            "patient": ["service.view"],
+        }
+        for role_key, patterns in role_permission_packs.items():
+            for pattern in patterns:
+                comparator = "LIKE" if pattern.endswith(".") else "="
+                value = f"{pattern}%" if pattern.endswith(".") else pattern
+                _safe_execute(
+                    f"""
+                    INSERT INTO rbac_role_permissions (role_id, permission_id, allowed, granted_by_user_id)
+                    SELECT r.role_id, p.permission_id, 1,
+                           ({admin_user_subquery})
+                    FROM rbac_roles r
+                    JOIN rbac_permissions p ON p.permission_key {comparator} ?
+                    WHERE r.role_key=?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM rbac_role_permissions rp
+                          WHERE rp.role_id=r.role_id AND rp.permission_id=p.permission_id
+                      )
+                    """,
+                    (value, role_key),
+                )
+
+        _safe_execute(
+            f"""
+            INSERT INTO rbac_user_role_assignments (user_id, role_id, assigned_by_user_id, is_active)
+            SELECT u.user_id, r.role_id,
+                   ({admin_user_subquery}),
+                   1
+            FROM Users u
+            JOIN rbac_roles r ON r.role_key = CASE
+                WHEN u.role='admin' THEN 'admin'
+                WHEN u.role='doctor' THEN 'doctor'
+                WHEN u.role='patient' THEN 'patient'
+                ELSE 'staff'
+            END
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM rbac_user_role_assignments ura
+                WHERE ura.user_id=u.user_id AND ura.role_id=r.role_id
+            )
+            """
+        )
+
+        for username, role_key in [("staff1", "receptionist"), ("quan.do", "accountant"), ("dung.bui", "nurse")]:
+            _safe_execute(
+                f"""
+                INSERT INTO rbac_user_role_assignments (user_id, role_id, assigned_by_user_id, is_active)
+                SELECT u.user_id, r.role_id,
+                       ({admin_user_subquery}),
+                       1
+                FROM Users u
+                JOIN rbac_roles r ON r.role_key=?
+                WHERE u.username=?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM rbac_user_role_assignments ura
+                      WHERE ura.user_id=u.user_id AND ura.role_id=r.role_id
+                  )
+                """,
+                (role_key, username),
+            )
+
+    def _write_audit_log(self, action_key, target_type, target_id, details):
+        actor_user_id = self.user_data.get("user_id")
+        _safe_execute(
+            "INSERT INTO rbac_audit_logs (actor_user_id, action_key, target_type, target_id, details) VALUES (?, ?, ?, ?, ?)",
+            (actor_user_id, action_key, target_type, _as_text(target_id), _as_text(details)),
+        )
+
+    def _build(self):
+        self._ensure_rbac_schema()
+        self._seed_rbac_defaults()
+
+        self.stats_layout = QtWidgets.QHBoxLayout()
+        self.stats_layout.setSpacing(12)
+        self.content_layout.addLayout(self.stats_layout)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.role_tab = self._badge("Quản lý vai trò", "success")
+        self.user_tab = self._badge("Quản lý người dùng", "neutral")
+        actions.addWidget(self.role_tab)
+        actions.addWidget(self.user_tab)
+        actions.addStretch()
+        add_role = self._button("Thêm vai trò", primary=True)
+        add_role.clicked.connect(self.add_role)
+        actions.addWidget(add_role)
+        cfg = self._button("Cấu hình quyền", primary=True)
+        cfg.clicked.connect(self.configure_permissions)
+        actions.addWidget(cfg)
+        assign_btn = self._button("Gán vai trò người dùng")
+        assign_btn.clicked.connect(self.assign_user_role)
+        actions.addWidget(assign_btn)
+        self.content_layout.addLayout(actions)
+
+        main = QtWidgets.QHBoxLayout()
+        main.setSpacing(16)
+        left = self._card()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.setContentsMargins(16, 16, 16, 16)
+        left_layout.addWidget(self._section_title("Danh sách vai trò"))
+        self.role_search = QtWidgets.QLineEdit()
+        self.role_search.setPlaceholderText("Tìm kiếm vai trò...")
+        self.role_search.setMinimumHeight(38)
+        self.role_search.setStyleSheet(FormDialog._input_style())
+        self.role_search.textChanged.connect(self._filter_roles)
+        left_layout.addWidget(self.role_search)
+        self.role_list = QtWidgets.QListWidget()
+        self.role_list.setStyleSheet("""
+            QListWidget { border: none; background: white; }
+            QListWidget::item { padding: 12px; border-radius: 10px; color: #0f172a; }
+            QListWidget::item:selected { background: #e8f7ef; color: #00a651; border-left: 3px solid #00a651; }
+        """)
+        self.role_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.role_list.currentTextChanged.connect(self._role_changed)
+        left_layout.addWidget(self.role_list)
+
+        role_actions = QtWidgets.QHBoxLayout()
+        role_actions.setSpacing(8)
+        edit_role_btn = self._button("Sửa")
+        edit_role_btn.clicked.connect(self.edit_role)
+        clone_role_btn = self._button("Nhân bản")
+        clone_role_btn.clicked.connect(self.clone_role)
+        toggle_role_btn = self._button("Bật/Tắt")
+        toggle_role_btn.clicked.connect(self.toggle_role)
+        delete_role_btn = self._button("Xóa", danger=True)
+        delete_role_btn.clicked.connect(self.delete_role)
+        role_actions.addWidget(edit_role_btn)
+        role_actions.addWidget(clone_role_btn)
+        role_actions.addWidget(toggle_role_btn)
+        role_actions.addWidget(delete_role_btn)
+        left_layout.addLayout(role_actions)
+        main.addWidget(left, 1)
+
+        right = self._card()
+        right_layout = QtWidgets.QVBoxLayout(right)
+        right_layout.setContentsMargins(16, 16, 16, 16)
+        self.permission_title = self._section_title("Danh sách quyền")
+        right_layout.addWidget(self.permission_title)
+        self.permission_subtitle = self._muted("")
+        right_layout.addWidget(self.permission_subtitle)
+        self.permission_table = QtWidgets.QTableWidget()
+        self.permission_table.setColumnCount(4)
+        self.permission_table.setHorizontalHeaderLabels(["Nhóm quyền", "Danh sách quyền", "Mô tả", "Trạng thái"])
+        self._style_table(self.permission_table, 12)
+        self.permission_table.setWordWrap(True)
+        self.permission_table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.permission_table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.permission_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.permission_table.setMinimumHeight(360)
+        right_layout.addWidget(self.permission_table)
+        main.addWidget(right, 2)
+        self.content_layout.addLayout(main)
+
+    def _query_roles(self):
+        return _safe_fetch_all(
+            """
+            SELECT
+                r.role_id,
+                r.role_key,
+                r.display_name,
+                r.description,
+                r.color_kind,
+                r.is_system,
+                r.is_active,
+                COALESCE(stats.total_users, 0) AS user_count
+            FROM rbac_roles r
+            LEFT JOIN (
+                SELECT ura.role_id, COUNT(*) AS total_users
+                FROM rbac_user_role_assignments ura
+                WHERE ura.is_active=1
+                GROUP BY ura.role_id
+            ) stats ON stats.role_id = r.role_id
+            ORDER BY r.is_system DESC, r.role_key ASC
+            """
+        )
+
+    def _query_permission_groups(self):
+        return _safe_fetch_all(
+            """
+            SELECT
+                g.group_id,
+                g.group_key,
+                g.display_name,
+                g.description,
+                g.sort_order,
+                p.permission_id,
+                p.permission_key,
+                p.display_name AS permission_name,
+                p.description AS permission_description,
+                p.is_sensitive,
+                p.is_active
+            FROM rbac_permission_groups g
+            LEFT JOIN rbac_permissions p ON p.group_id = g.group_id
+            WHERE g.is_active=1
+            ORDER BY g.sort_order ASC, g.group_id ASC, p.permission_id ASC
+            """
+        )
+
+    def _query_role_permissions(self):
+        rows = _safe_fetch_all(
+            """
+            SELECT role_id, permission_id, allowed
+            FROM rbac_role_permissions
+            """
+        )
+        data = {}
+        for row in rows:
+            data[(row.get("role_id"), row.get("permission_id"))] = bool(row.get("allowed", True))
+        return data
+
+    def _render_stats(self):
+        while self.stats_layout.count():
+            item = self.stats_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        role_count = len(self.role_rows)
+        user_count = sum(_as_int(item.get("user_count")) for item in self.role_rows)
+        permission_count = sum(1 for item in self.permission_rows if item.get("permission_id"))
+        permission_groups = len({item.get("group_id") for item in self.permission_rows if item.get("group_id")})
+        self.stats_layout.addWidget(self._stat_card("🛡", "Tổng vai trò", role_count, "vai trò trong hệ thống", "#00a651"))
+        self.stats_layout.addWidget(self._stat_card("👥", "Tổng người dùng", user_count, "người dùng đã phân quyền", "#2563eb"))
+        self.stats_layout.addWidget(self._stat_card("🔑", "Tổng quyền", permission_count, "quyền trong hệ thống", "#f97316"))
+        self.stats_layout.addWidget(self._stat_card("◔", "Nhóm quyền", permission_groups, "nhóm quyền chức năng", "#8b5cf6"))
+
+    def _filter_roles(self):
+        self._render_roles()
+
+    def _render_roles(self):
+        keyword = _as_text(self.role_search.text()).lower().strip()
+        selected_role_id = self.selected_role_id
+        self.role_list.clear()
+
+        for role in self.role_rows:
+            searchable = " ".join([
+                _as_text(role.get("role_key")),
+                _as_text(role.get("display_name")),
+                _as_text(role.get("description")),
+            ]).lower()
+            if keyword and keyword not in searchable:
+                continue
+
+            icon = self.ROLE_ICONS.get(_as_text(role.get("role_key")).lower(), "🛡")
+            users = f"{_as_int(role.get('user_count'))} người dùng"
+            status = "Hoạt động" if bool(role.get("is_active", True)) else "Tạm ngưng"
+            item = QtWidgets.QListWidgetItem(
+                f"{icon}  {_as_text(role.get('display_name'))}\n"
+                f"   {_as_text(role.get('description'))} · {users} · {status}"
+            )
+            item.setSizeHint(QtCore.QSize(0, 66))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, role.get("role_key"))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, role.get("role_id"))
+            self.role_list.addItem(item)
+
+        if self.role_list.count() == 0:
+            self.selected_role = ""
+            self.selected_role_id = None
+            self.permission_title.setText("Danh sách quyền của vai trò")
+            self.permission_subtitle.setText("Không có vai trò phù hợp")
+            self.permission_table.setRowCount(0)
+            return
+
+        for idx in range(self.role_list.count()):
+            role_id = self.role_list.item(idx).data(QtCore.Qt.ItemDataRole.UserRole + 1)
+            if role_id == selected_role_id:
+                self.role_list.setCurrentRow(idx)
+                return
+        self.role_list.setCurrentRow(0)
+
+    def refresh(self):
+        self.role_rows = self._query_roles()
+        self.permission_rows = self._query_permission_groups()
+        self.role_permission_map = self._query_role_permissions()
+        self._render_stats()
+        self._render_roles()
+
+    def _role_changed(self, _text=None):
+        item = self.role_list.currentItem()
+        if item:
+            self.selected_role = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            self.selected_role_id = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        self._fill_permissions()
+
+    def _fill_permissions(self):
+        role_row = next((item for item in self.role_rows if item.get("role_id") == self.selected_role_id), None)
+        if role_row is None:
+            self.permission_title.setText("Danh sách quyền của vai trò")
+            self.permission_subtitle.setText("Chưa chọn vai trò")
+            self.permission_table.setRowCount(0)
+            return
+
+        self.permission_title.setText(f"Danh sách quyền của vai trò: {_as_text(role_row.get('display_name'))}")
+        self.permission_subtitle.setText(f"{_as_text(role_row.get('description'))} · {_as_int(role_row.get('user_count'))} người dùng")
+
+        grouped = {}
+        for row in self.permission_rows:
+            group_id = row.get("group_id")
+            if not group_id or not row.get("permission_id"):
+                continue
+            grouped.setdefault(group_id, {
+                "group_name": row.get("display_name"),
+                "permissions": [],
+            })
+            grouped[group_id]["permissions"].append(row)
+
+        rows = list(grouped.values())
+        row_count = sum(len(item.get("permissions", [])) for item in rows)
+        self.permission_table.setRowCount(row_count)
+        table_row = 0
+        for group in rows:
+            group_name = _as_text(group.get("group_name"))
+            permissions = group.get("permissions", [])
+            for index, permission in enumerate(permissions):
+                permission_id = permission.get("permission_id")
+                group_text = f"⌄  {group_name}\n   {len(permissions)} quyền" if index == 0 else ""
+                self.permission_table.setItem(table_row, 0, QtWidgets.QTableWidgetItem(group_text))
+                self.permission_table.setItem(table_row, 1, QtWidgets.QTableWidgetItem(_as_text(permission.get("permission_name"))))
+                self.permission_table.setItem(table_row, 2, QtWidgets.QTableWidgetItem(_as_text(permission.get("permission_description"))))
+
+                allowed = bool(self.role_permission_map.get((self.selected_role_id, permission_id), False))
+                status_text = "Được phép" if allowed else "Không được phép"
+                status_kind = "success" if allowed else "danger"
+                if bool(permission.get("is_sensitive")):
+                    status_text += " · Nhạy cảm"
+                self.permission_table.setCellWidget(table_row, 3, self._badge(status_text, status_kind))
+                self.permission_table.setRowHeight(table_row, 50 if index == 0 else 34)
+                table_row += 1
+            self.permission_table.setMinimumHeight(min(560, 42 + row_count * 34 + len(rows) * 16))
+
+    def _selected_role_row(self):
+        return next((item for item in self.role_rows if item.get("role_id") == self.selected_role_id), None)
+
+    def add_role(self):
+        fields = [
+            {"key": "role_key", "label": "Mã vai trò (không dấu)"},
+            {"key": "display_name", "label": "Tên vai trò"},
+            {"key": "description", "label": "Mô tả"},
+            {"key": "color_kind", "label": "Màu hiển thị", "type": "combo", "options": [("Xanh lá", "success"), ("Xanh dương", "info"), ("Cam", "warning"), ("Xám", "neutral")]},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Tạm ngưng", 0)]},
+        ]
+        dialog = FormDialog("Thêm vai trò", fields, {"color_kind": "success", "is_active": 1}, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        role_key = _as_text(values.get("role_key")).lower().strip()
+        if not role_key or not _as_text(values.get("display_name")).strip():
+            self._show_info("Thiếu dữ liệu", "Mã vai trò và tên vai trò là bắt buộc.")
+            return
+        if _safe_fetch_all("SELECT role_id FROM rbac_roles WHERE role_key=?", (role_key,)):
+            self._show_info("Trùng vai trò", "Mã vai trò đã tồn tại.")
+            return
+        ok = _safe_execute(
+            "INSERT INTO rbac_roles (role_key, display_name, description, color_kind, is_system, is_active) VALUES (?, ?, ?, ?, 0, ?)",
+            (role_key, values.get("display_name"), values.get("description"), values.get("color_kind"), values.get("is_active")),
+        )
+        if ok:
+            self._write_audit_log("rbac.role.create", "role", role_key, f"Tạo vai trò {values.get('display_name')}")
+        self._show_info("Vai trò", "Tạo vai trò thành công." if ok else "Không thể tạo vai trò.")
+        self.refresh()
+
+    def edit_role(self):
+        role = self._selected_role_row()
+        if not role:
+            self._show_info("Vai trò", "Vui lòng chọn vai trò.")
+            return
+        fields = [
+            {"key": "display_name", "label": "Tên vai trò"},
+            {"key": "description", "label": "Mô tả"},
+            {"key": "color_kind", "label": "Màu hiển thị", "type": "combo", "options": [("Xanh lá", "success"), ("Xanh dương", "info"), ("Cam", "warning"), ("Xám", "neutral")]},
+            {"key": "is_active", "label": "Trạng thái", "type": "combo", "options": [("Hoạt động", 1), ("Tạm ngưng", 0)]},
+        ]
+        dialog = FormDialog("Sửa vai trò", fields, role, self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        if not _as_text(values.get("display_name")).strip():
+            self._show_info("Thiếu dữ liệu", "Tên vai trò không được để trống.")
+            return
+        if bool(role.get("is_system")) and int(values.get("is_active") or 0) == 0 and _as_text(role.get("role_key")) == "admin":
+            self._show_info("Bảo vệ Admin", "Không thể tạm ngưng vai trò hệ thống Admin.")
+            return
+        ok = _safe_execute(
+            "UPDATE rbac_roles SET display_name=?, description=?, color_kind=?, is_active=? WHERE role_id=?",
+            (values.get("display_name"), values.get("description"), values.get("color_kind"), values.get("is_active"), role.get("role_id")),
+        )
+        if ok:
+            self._write_audit_log("rbac.role.update", "role", role.get("role_key"), f"Cập nhật vai trò {values.get('display_name')}")
+        self._show_info("Vai trò", "Cập nhật vai trò thành công." if ok else "Không thể cập nhật vai trò.")
+        self.refresh()
+
+    def clone_role(self):
+        role = self._selected_role_row()
+        if not role:
+            self._show_info("Nhân bản vai trò", "Vui lòng chọn vai trò.")
+            return
+        new_key, ok_input = QtWidgets.QInputDialog.getText(
+            self,
+            "Nhân bản vai trò",
+            "Nhập mã vai trò mới:",
+            text=f"{_as_text(role.get('role_key'))}_copy",
+        )
+        if not ok_input:
+            return
+        new_key = _as_text(new_key).lower().strip()
+        if not new_key:
+            self._show_info("Nhân bản vai trò", "Mã vai trò mới không hợp lệ.")
+            return
+        if _safe_fetch_all("SELECT role_id FROM rbac_roles WHERE role_key=?", (new_key,)):
+            self._show_info("Nhân bản vai trò", "Mã vai trò đã tồn tại.")
+            return
+        ok = _safe_execute(
+            "INSERT INTO rbac_roles (role_key, display_name, description, color_kind, is_system, is_active) VALUES (?, ?, ?, ?, 0, 1)",
+            (new_key, f"{_as_text(role.get('display_name'))} (Bản sao)", role.get("description"), role.get("color_kind")),
+        )
+        if not ok:
+            self._show_info("Nhân bản vai trò", "Không thể tạo vai trò bản sao.")
+            return
+
+        new_role = _safe_fetch_all("SELECT role_id FROM rbac_roles WHERE role_key=?", (new_key,))
+        if new_role:
+            _safe_execute(
+                """
+                INSERT INTO rbac_role_permissions (role_id, permission_id, allowed, granted_by_user_id)
+                SELECT ?, permission_id, allowed, ?
+                FROM rbac_role_permissions
+                WHERE role_id=?
+                """,
+                (new_role[0].get("role_id"), self.user_data.get("user_id"), role.get("role_id")),
+            )
+        self._write_audit_log("rbac.role.clone", "role", new_key, f"Nhân bản từ {role.get('role_key')}")
+        self._show_info("Nhân bản vai trò", "Đã nhân bản vai trò và quyền đi kèm.")
+        self.refresh()
+
+    def toggle_role(self):
+        role = self._selected_role_row()
+        if not role:
+            self._show_info("Vai trò", "Vui lòng chọn vai trò.")
+            return
+        new_state = 0 if bool(role.get("is_active", True)) else 1
+        if _as_text(role.get("role_key")) == "admin" and new_state == 0:
+            self._show_info("Bảo vệ Admin", "Không thể tắt vai trò Admin.")
+            return
+        ok = _safe_execute("UPDATE rbac_roles SET is_active=? WHERE role_id=?", (new_state, role.get("role_id")))
+        if ok:
+            self._write_audit_log("rbac.role.toggle", "role", role.get("role_key"), f"Đổi trạng thái -> {new_state}")
+        self._show_info("Vai trò", "Đã cập nhật trạng thái vai trò." if ok else "Không thể cập nhật trạng thái.")
+        self.refresh()
+
+    def delete_role(self):
+        role = self._selected_role_row()
+        if not role:
+            self._show_info("Vai trò", "Vui lòng chọn vai trò.")
+            return
+        if bool(role.get("is_system")):
+            self._show_info("Xóa vai trò", "Không thể xóa vai trò hệ thống.")
+            return
+        assignments = _safe_fetch_all(
+            "SELECT assignment_id FROM rbac_user_role_assignments WHERE role_id=? AND is_active=1",
+            (role.get("role_id"),),
+        )
+        if assignments:
+            self._show_info("Xóa vai trò", "Vai trò đang có người dùng. Hãy gỡ gán trước khi xóa.")
+            return
+        if not self._confirm("Xóa vai trò", f"Bạn có chắc muốn xóa vai trò {_as_text(role.get('display_name'))}?"):
+            return
+        _safe_execute("DELETE FROM rbac_role_permissions WHERE role_id=?", (role.get("role_id"),))
+        ok = _safe_execute("DELETE FROM rbac_roles WHERE role_id=?", (role.get("role_id"),))
+        if ok:
+            self._write_audit_log("rbac.role.delete", "role", role.get("role_key"), "Xóa vai trò")
+        self._show_info("Xóa vai trò", "Xóa vai trò thành công." if ok else "Không thể xóa vai trò.")
+        self.refresh()
+
+    def configure_permissions(self):
+        role = self._selected_role_row()
+        if not role:
+            self._show_info("Cấu hình quyền", "Vui lòng chọn vai trò.")
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Cấu hình quyền - {_as_text(role.get('display_name'))}")
+        dialog.setMinimumSize(860, 580)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.addWidget(self._muted("Chọn quyền cấp cho vai trò. Các quyền nhạy cảm được đánh dấu ⚠."))
+
+        table = QtWidgets.QTableWidget()
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Nhóm", "Quyền", "Mô tả", "Cấp quyền"])
+        self._style_table(table, 12)
+        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table.setWordWrap(True)
+        table.setRowCount(sum(1 for row in self.permission_rows if row.get("permission_id")))
+
+        row_idx = 0
+        checkboxes = []
+        for row in self.permission_rows:
+            if not row.get("permission_id"):
+                continue
+            table.setItem(row_idx, 0, QtWidgets.QTableWidgetItem(_as_text(row.get("display_name"))))
+            name = _as_text(row.get("permission_name"))
+            if bool(row.get("is_sensitive")):
+                name = f"⚠ {name}"
+            table.setItem(row_idx, 1, QtWidgets.QTableWidgetItem(name))
+            table.setItem(row_idx, 2, QtWidgets.QTableWidgetItem(_as_text(row.get("permission_description"))))
+            cb = QtWidgets.QCheckBox()
+            cb.setChecked(bool(self.role_permission_map.get((role.get("role_id"), row.get("permission_id")), False)))
+            wrap = QtWidgets.QWidget()
+            wrap_layout = QtWidgets.QHBoxLayout(wrap)
+            wrap_layout.setContentsMargins(0, 0, 0, 0)
+            wrap_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            wrap_layout.addWidget(cb)
+            table.setCellWidget(row_idx, 3, wrap)
+            checkboxes.append((row.get("permission_id"), cb))
+            row_idx += 1
+        table.setRowCount(row_idx)
+        layout.addWidget(table)
+
+        btns = QtWidgets.QHBoxLayout()
+        select_all = self._button("Cấp tất cả")
+        clear_all = self._button("Gỡ tất cả")
+        save_btn = self._button("Lưu thay đổi", primary=True)
+        cancel_btn = self._button("Hủy")
+        btns.addWidget(select_all)
+        btns.addWidget(clear_all)
+        btns.addStretch()
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        layout.addLayout(btns)
+
+        select_all.clicked.connect(lambda: [cb.setChecked(True) for _, cb in checkboxes])
+        clear_all.clicked.connect(lambda: [cb.setChecked(False) for _, cb in checkboxes])
+        cancel_btn.clicked.connect(dialog.reject)
+
+        def _save():
+            if _as_text(role.get("role_key")) == "admin":
+                for permission_id, cb in checkboxes:
+                    if not cb.isChecked():
+                        self._show_info("Bảo vệ Admin", "Vai trò Admin phải giữ toàn bộ quyền.")
+                        return
+
+            _safe_execute("DELETE FROM rbac_role_permissions WHERE role_id=?", (role.get("role_id"),))
+            for permission_id, cb in checkboxes:
+                if cb.isChecked():
+                    _safe_execute(
+                        "INSERT INTO rbac_role_permissions (role_id, permission_id, allowed, granted_by_user_id) VALUES (?, ?, 1, ?)",
+                        (role.get("role_id"), permission_id, self.user_data.get("user_id")),
+                    )
+            self._write_audit_log("rbac.permission.assign", "role", role.get("role_key"), "Cập nhật tập quyền")
+            dialog.accept()
+
+        save_btn.clicked.connect(_save)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self._show_info("Cấu hình quyền", "Cập nhật quyền thành công.")
+            self.refresh()
+
+    def assign_user_role(self):
+        users = _safe_fetch_all("SELECT user_id, username, role FROM Users ORDER BY username ASC")
+        if not users:
+            self._show_info("Gán vai trò", "Chưa có người dùng trong hệ thống.")
+            return
+        roles = self._query_roles()
+        if not roles:
+            self._show_info("Gán vai trò", "Chưa có vai trò khả dụng.")
+            return
+
+        user_map = {f"{_as_text(u.get('username'))} (#{_as_int(u.get('user_id'))})": u for u in users}
+        role_map = {f"{_as_text(r.get('display_name'))} ({_as_text(r.get('role_key'))})": r for r in roles if bool(r.get("is_active", True))}
+
+        user_label, ok_user = QtWidgets.QInputDialog.getItem(self, "Gán vai trò", "Chọn người dùng:", list(user_map.keys()), editable=False)
+        if not ok_user:
+            return
+        role_label, ok_role = QtWidgets.QInputDialog.getItem(self, "Gán vai trò", "Chọn vai trò:", list(role_map.keys()), editable=False)
+        if not ok_role:
+            return
+
+        user = user_map.get(user_label)
+        role = role_map.get(role_label)
+        if user is None or role is None:
+            self._show_info("Gán vai trò", "Dữ liệu không hợp lệ.")
+            return
+
+        existing = _safe_fetch_all(
+            "SELECT assignment_id FROM rbac_user_role_assignments WHERE user_id=? AND role_id=?",
+            (user.get("user_id"), role.get("role_id")),
+        )
+        if existing:
+            ok = _safe_execute(
+                """
+                UPDATE rbac_user_role_assignments
+                SET is_active=1,
+                    assigned_by_user_id=?,
+                    assigned_at=CURRENT_TIMESTAMP
+                WHERE assignment_id=?
+                """,
+                (self.user_data.get("user_id"), existing[0].get("assignment_id")),
+            )
+        else:
+            ok = _safe_execute(
+                "INSERT INTO rbac_user_role_assignments (user_id, role_id, assigned_by_user_id, is_active) VALUES (?, ?, ?, 1)",
+                (user.get("user_id"), role.get("role_id"), self.user_data.get("user_id")),
+            )
+        if ok:
+            self._write_audit_log(
+                "rbac.user_role.assign",
+                "user",
+                user.get("user_id"),
+                f"Gán role {_as_text(role.get('role_key'))} cho user {_as_text(user.get('username'))}",
+            )
+        self._show_info("Gán vai trò", "Gán vai trò thành công." if ok else "Không thể gán vai trò.")
+        self.refresh()
+
+
+class BackupManagementPage(AdminBasePage):
+    page_title = "Sao lưu dữ liệu"
+    breadcrumb = "Dashboard / Sao lưu dữ liệu"
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(user_data, parent)
+        self.backups_root = Path(__file__).resolve().parents[1] / "backups"
+        self.history_page = 1
+        self.history_limit = 10
+        self.history_total_pages = 1
+        self.history_total = 0
+        self.selected_backup_id = None
+        self._last_summary = {}
+        self._last_items = []
+        self._build()
+        self.refresh()
+
+    def _ensure_seed_data(self):
+        return False
+
+    def _build(self):
+        self.stats_row = QtWidgets.QHBoxLayout()
+        self.stats_row.setSpacing(12)
+        self.content_layout.addLayout(self.stats_row)
+
+        main = QtWidgets.QHBoxLayout()
+        main.setSpacing(16)
+        left = QtWidgets.QVBoxLayout()
+        now_card = self._card()
+        now_layout = QtWidgets.QVBoxLayout(now_card)
+        now_layout.setContentsMargins(18, 18, 18, 18)
+        now_layout.addWidget(self._section_title("Sao lưu dữ liệu ngay"))
+        now_layout.addWidget(self._muted("Tạo bản sao lưu dữ liệu động từ DB. Quá trình có thể mất vài phút tùy dung lượng thực tế."))
+        self.ready_box = self._badge("Hệ thống sẵn sàng để sao lưu", "success")
+        now_layout.addWidget(self.ready_box)
+        now_layout.addWidget(self._muted("Tất cả dữ liệu sẽ được sao lưu an toàn."))
+        action_row = QtWidgets.QHBoxLayout()
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItem("Cloud", "cloud")
+        self.mode_combo.addItem("Local", "local")
+        self.mode_combo.setStyleSheet(FormDialog._input_style())
+        backup_btn = self._button("Sao lưu ngay", primary=True)
+        backup_btn.clicked.connect(self.backup_now)
+        advanced_btn = self._button("Tùy chọn nâng cao")
+        advanced_btn.clicked.connect(lambda: self._show_info("Tùy chọn nâng cao", "Hiện hỗ trợ chọn Cloud/Local; các tùy chọn mở rộng phụ thuộc hạ tầng lưu trữ."))
+        action_row.addWidget(self.mode_combo)
+        action_row.addWidget(backup_btn)
+        action_row.addWidget(advanced_btn)
+        action_row.addStretch()
+        now_layout.addLayout(action_row)
+        left.addWidget(now_card)
+
+        history_card = self._card()
+        history_layout = QtWidgets.QVBoxLayout(history_card)
+        history_layout.setContentsMargins(18, 18, 18, 18)
+        history_title = QtWidgets.QHBoxLayout()
+        history_title.addWidget(self._section_title("Lịch sử sao lưu"))
+        history_title.addStretch()
+        history_title.addWidget(self._badge("Xem tất cả", "info"))
+        history_layout.addLayout(history_title)
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Thời gian", "Loại", "Dung lượng", "Người tạo", "Trạng thái", "Thao tác"])
+        self._style_table(self.table, 12)
+        self.table.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.setMinimumHeight(42 + 5 * 44)
+        history_layout.addWidget(self.table)
+
+        pager = QtWidgets.QHBoxLayout()
+        pager.setSpacing(8)
+        pager.addWidget(QtWidgets.QLabel("Hiển thị"))
+        self.history_page_size_combo = QtWidgets.QComboBox()
+        for item in ["10", "20", "50", "100"]:
+            self.history_page_size_combo.addItem(item)
+        self.history_page_size_combo.setCurrentText(str(self.history_limit))
+        self.history_page_size_combo.setFixedWidth(72)
+        self.history_page_size_combo.setStyleSheet(FormDialog._input_style())
+        self.history_page_size_combo.currentTextChanged.connect(self._change_history_page_size)
+        pager.addWidget(self.history_page_size_combo)
+        pager.addWidget(QtWidgets.QLabel("bản ghi"))
+        pager.addStretch()
+        self.history_prev_btn = self._button("‹")
+        self.history_prev_btn.setFixedWidth(38)
+        self.history_prev_btn.clicked.connect(self._prev_history_page)
+        self.history_page_label = QtWidgets.QLabel("Trang 1/1")
+        self.history_page_label.setStyleSheet("font-weight: 900; color: #0f172a;")
+        self.history_next_btn = self._button("›")
+        self.history_next_btn.setFixedWidth(38)
+        self.history_next_btn.clicked.connect(self._next_history_page)
+        pager.addWidget(self.history_prev_btn)
+        pager.addWidget(self.history_page_label)
+        pager.addWidget(self.history_next_btn)
+        history_layout.addLayout(pager)
+
+        left.addWidget(history_card)
+        main.addLayout(left, 2)
+
+        right = QtWidgets.QVBoxLayout()
+        self.info_card = self._card()
+        self.options_card = self._card()
+        self.restore_card = self._card()
+        for card in [self.info_card, self.options_card, self.restore_card]:
+            right.addWidget(card)
+        right.addStretch()
+        main.addLayout(right, 1)
+        self.content_layout.addLayout(main)
+
+    def _status_label(self, status):
+        value = _as_text(status).lower().strip()
+        mapping = {
+            "success": "Thành công",
+            "processing": "Đang xử lý",
+            "failed": "Thất bại",
+            "expired": "Đã hết hạn",
+        }
+        return mapping.get(value, _as_text(status) or "Không xác định")
+
+    def _status_kind_from_value(self, status):
+        value = _as_text(status).lower().strip()
+        if value == "success":
+            return "success"
+        if value == "processing":
+            return "info"
+        if value == "failed":
+            return "danger"
+        if value == "expired":
+            return "neutral"
+        return "neutral"
+
+    def _status_for_system(self):
+        value = _as_text((self._last_summary or {}).get("system_status") or "warning").lower().strip()
+        if value == "safe":
+            return "success"
+        if value == "danger":
+            return "danger"
+        if value == "processing":
+            return "info"
+        return "warning"
+
+    def _frequency_label(self, frequency):
+        mapping = {
+            "daily": "Hàng ngày",
+            "weekly": "Hàng tuần",
+            "monthly": "Hàng tháng",
+        }
+        return mapping.get(_as_text(frequency).lower().strip(), "Hàng ngày")
+
+    def _mode_label(self, mode):
+        value = _as_text(mode).lower().strip()
+        return "Cloud" if value == "cloud" else "Local"
+
+    def _relative_time(self, value):
+        text = _as_text(value).strip()
+        if not text:
+            return "Chưa có"
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(text[:19], fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            return text
+
+        delta_seconds = int((datetime.now() - parsed).total_seconds())
+        if delta_seconds < 60:
+            return "Vừa xong"
+        if delta_seconds < 3600:
+            return f"{delta_seconds // 60} phút trước"
+        if delta_seconds < 86400:
+            return f"{delta_seconds // 3600} giờ trước"
+        return f"{delta_seconds // 86400} ngày trước"
+
+    def _can_use_backup_permission(self, permission_key):
+        user_id = self.user_data.get("user_id")
+        if not user_id:
+            return False
+        rows = _safe_fetch_all(
+            f"""
+            SELECT rp.allowed
+            FROM rbac_user_role_assignments ura
+            JOIN rbac_role_permissions rp ON rp.role_id = ura.role_id
+            JOIN rbac_permissions p ON p.permission_id = rp.permission_id
+            WHERE ura.user_id=?
+              AND ura.is_active=1
+              AND p.permission_key=?
+            {"LIMIT 1" if DB_TYPE == "mysql" else ""}
+            """,
+            (user_id, permission_key),
+        )
+        if not rows:
+            return _as_text(self.user_data.get("role")).lower().strip() == "admin"
+        return bool(rows[0].get("allowed", True))
+
+    def refresh(self):
+        try:
+            summary = SettingsController.backup_summary() or {}
+            history_payload = SettingsController.backup_history(page=self.history_page, limit=self.history_limit) or {}
+        except Exception as exc:
+            self._show_info("Sao lưu dữ liệu", f"Không thể tải dữ liệu sao lưu động: {exc}")
+            summary = {}
+            history_payload = {}
+
+        self._last_summary = summary
+        self._last_items = history_payload.get("items") or []
+        pagination = history_payload.get("pagination") or {}
+        self.history_total = _as_int(pagination.get("total"))
+        self.history_total_pages = max(1, _as_int(pagination.get("total_pages")) or 1)
+        self.history_page = min(max(1, self.history_page), self.history_total_pages)
+
+        total_size = _as_int(summary.get("total_size_bytes"))
+        last_row = summary.get("last_backup") or {}
+        last = _format_datetime(last_row.get("created_at")) if last_row else "Chưa có"
+        schedule_time = _as_text(summary.get("schedule_time") or "02:00")
+        schedule_text = f"{schedule_time}"
+        system_status = _as_text(summary.get("system_status") or "warning")
+        system_status_text = {
+            "safe": "An toàn",
+            "warning": "Cảnh báo",
+            "danger": "Nguy hiểm",
+        }.get(system_status, "Cảnh báo")
+        system_hint = "Dữ liệu được bảo vệ" if system_status == "safe" else "Cần kiểm tra cấu hình sao lưu"
+
+        while self.stats_row.count():
+            item = self.stats_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for card in [
+            self._stat_card("🗄", "Tổng dung lượng dữ liệu", self._backup_size_text(total_size), "Tính trên toàn bộ dữ liệu sao lưu", "#2563eb"),
+            self._stat_card("☁", "Bản sao lưu gần nhất", last, self._relative_time(last_row.get("created_at")), "#00a651"),
+            self._stat_card("🕑", "Lịch sao lưu tự động", schedule_text, self._frequency_label(summary.get("schedule_frequency")), "#f97316"),
+            self._stat_card("🛡", "Trạng thái hệ thống", system_status_text, system_hint, "#8b5cf6"),
+        ]:
+            self.stats_row.addWidget(card)
+        status_text = {
+            "safe": "Hệ thống sao lưu ổn định",
+            "danger": "Hệ thống đang có rủi ro",
+            "warning": "Hệ thống cần kiểm tra",
+            "processing": "Hệ thống đang xử lý sao lưu",
+        }.get(_as_text(summary.get("system_status") or "warning"), "Hệ thống cần kiểm tra")
+        self.ready_box.setText(status_text)
+        self.ready_box.setStyleSheet(self._badge(status_text, self._status_for_system()).styleSheet())
+        self._fill_table(self._last_items)
+        self._fill_side_cards(summary, total_size)
+        self._render_history_pagination()
+
+    def _render_history_pagination(self):
+        start = 0 if self.history_total == 0 else (self.history_page - 1) * self.history_limit + 1
+        end = min(self.history_total, self.history_page * self.history_limit)
+        self.history_page_label.setText(f"{start}-{end}/{self.history_total} • Trang {self.history_page}/{self.history_total_pages}")
+        self.history_prev_btn.setEnabled(self.history_page > 1)
+        self.history_next_btn.setEnabled(self.history_page < self.history_total_pages)
+
+    def _change_history_page_size(self, value):
+        self.history_limit = max(1, int(value or 10))
+        self.history_page = 1
+        self.refresh()
+
+    def _prev_history_page(self):
+        if self.history_page > 1:
+            self.history_page -= 1
+            self.refresh()
+
+    def _next_history_page(self):
+        if self.history_page < self.history_total_pages:
+            self.history_page += 1
+            self.refresh()
+
+    def _backup_size_text(self, size):
+        if size >= 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024 * 1024):.1f} GB"
+        if size >= 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        return f"{size / 1024:.1f} KB"
+
+    def _fill_table(self, items):
+        self.table.setRowCount(len(items))
+        for row, item in enumerate(items):
+            created_at_text = _format_datetime(item.get("created_at"))
+            status_value = _as_text(item.get("status") or "success").lower().strip()
+            status_label = self._status_label(status_value)
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(created_at_text))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem("Tự động" if _as_text(item.get("backup_type")) == "automatic" else "Thủ công"))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(self._backup_size_text(_as_int(item.get("size_bytes")))))
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(_as_text(item.get("created_by_name")) or "Hệ thống"))
+            self.table.setCellWidget(row, 4, self._badge(status_label, self._status_kind_from_value(status_value)))
+            download = self._icon_button("Tải", "info")
+            delete = self._icon_button("Xóa", "danger")
+            restore = self._icon_button("Đổi", "success")
+            download.clicked.connect(lambda _, file_item=item: self.download_backup(file_item))
+            delete.clicked.connect(lambda _, file_item=item: self.delete_backup(file_item))
+            restore.clicked.connect(lambda _, file_item=item: self.select_backup_for_restore(file_item))
+
+            can_download = self._can_use_backup_permission("backup.view")
+            can_delete = self._can_use_backup_permission("backup.delete") or self._can_use_backup_permission("backup.execute")
+            can_restore = self._can_use_backup_permission("backup.restore")
+
+            download.setEnabled(can_download and status_value == "success")
+            delete.setEnabled(can_delete and status_value != "processing")
+            restore.setEnabled(can_restore and status_value == "success")
+
+            self.table.setCellWidget(row, 5, self._action_cell([download, restore, delete]))
+            self.table.setRowHeight(row, 44)
+
+    def _fill_side_cards(self, summary, total_size):
+        settings = summary.get("settings") or {}
+        last_row = summary.get("last_backup") or {}
+        selected_text = "Chưa chọn"
+        if self.selected_backup_id:
+            selected_text = self.selected_backup_id
+        specs = [
+            (self.info_card, "Thông tin sao lưu", [
+                f"Vị trí lưu trữ: {_as_text(summary.get('storage_location') or 'Máy chủ nội bộ')}",
+                f"Đường dẫn: {_as_text(summary.get('storage_path') or 'backups/local')}",
+                f"Tổng số bản sao lưu: {_as_int(summary.get('total_backups'))} bản",
+                f"Bản sao lưu gần nhất: {_format_datetime(last_row.get('created_at')) if last_row else 'Chưa có'}",
+                f"Bản sao lưu tiếp theo: {_format_datetime(summary.get('next_backup_at')) if summary.get('next_backup_at') else 'Chưa có lịch'}",
+                f"Phương thức: {self._frequency_label(summary.get('schedule_frequency'))}",
+                f"Giữ lại bản sao lưu: {_as_int(summary.get('retention_days') or 30)} ngày",
+            ]),
+            (self.options_card, "Tùy chọn sao lưu", [
+                ("Sao lưu tự động", "auto_backup", bool(settings.get("auto_backup", True))),
+                ("Sao lưu cơ sở dữ liệu", "include_database", bool(settings.get("include_database", True))),
+                ("Sao lưu tệp đính kèm", "include_attachments", bool(settings.get("include_attachments", True))),
+                ("Nén dữ liệu", "compress_data", bool(settings.get("compress_data", True))),
+                ("Gửi email thông báo", "email_notification", bool(settings.get("email_notification", False))),
+            ]),
+            (self.restore_card, "Khôi phục dữ liệu", [
+                "Khôi phục dữ liệu từ bản sao lưu đã chọn.",
+                "Bạn nên tạo bản sao lưu hiện tại trước khi khôi phục.",
+                f"Bản đã chọn: {selected_text}",
+            ]),
+        ]
+        for card, title, lines in specs:
+            layout = card.layout()
+            if layout:
+                while layout.count():
+                    item = layout.takeAt(0)
+                    if item.widget():
+                        item.widget().deleteLater()
+            else:
+                layout = QtWidgets.QVBoxLayout(card)
+                layout.setContentsMargins(18, 18, 18, 18)
+            layout.addWidget(self._section_title(title))
+            for line in lines:
+                if card is self.options_card:
+                    row = QtWidgets.QHBoxLayout()
+                    label, setting_key, setting_value = line
+                    row.addWidget(self._muted(label))
+                    row.addStretch()
+                    toggle = QtWidgets.QCheckBox()
+                    toggle.setChecked(bool(setting_value))
+                    toggle.setEnabled(self._can_use_backup_permission("backup.execute"))
+                    toggle.stateChanged.connect(
+                        lambda state, key=setting_key, name=label: self._toggle_backup_setting(key, state, name)
+                    )
+                    row.addWidget(toggle)
+                    row.addWidget(self._badge("Bật" if bool(setting_value) else "Tắt", "success" if bool(setting_value) else "neutral"))
+                    layout.addLayout(row)
+                else:
+                    layout.addWidget(self._muted(line))
+            if card is self.restore_card:
+                restore_btn = self._button("Khôi phục từ bản đã chọn", danger=True)
+                restore_btn.clicked.connect(self.restore_selected_backup)
+                restore_btn.setEnabled(self._can_use_backup_permission("backup.restore") and bool(self.selected_backup_id))
+                layout.addWidget(restore_btn)
+                pick_btn = self._button("Chọn bản sao lưu để khôi phục")
+                pick_btn.clicked.connect(self.open_restore_picker)
+                pick_btn.setEnabled(self._can_use_backup_permission("backup.restore"))
+                layout.addWidget(pick_btn)
+            layout.addStretch()
+
+        if self.options_card.layout() is not None:
+            footer = QtWidgets.QHBoxLayout()
+            footer.addStretch()
+            advanced_btn = self._button("Tùy chọn nâng cao")
+            advanced_btn.clicked.connect(self.open_advanced_options)
+            advanced_btn.setEnabled(self._can_use_backup_permission("backup.execute"))
+            footer.addWidget(advanced_btn)
+            self.options_card.layout().addLayout(footer)
+
+    def backup_now(self):
+        if not self._can_use_backup_permission("backup.execute"):
+            self._show_info("Sao lưu dữ liệu", "Bạn không có quyền tạo bản sao lưu.")
+            return
+        user_id = self.user_data.get("user_id")
+        if not user_id:
+            self._show_info("Sao lưu dữ liệu", "Không xác định được tài khoản hiện tại.")
+            return
+        mode = self.mode_combo.currentData() or "local"
+        if not self._confirm("Sao lưu dữ liệu", "Bạn có chắc muốn tạo bản sao lưu mới?"):
+            return
+        ok, result = SettingsController.backup_now(user_id, mode)
+        self._show_info("Sao lưu dữ liệu", f"Sao lưu thành công.\n{result}" if ok else _as_text(result, "Không thể sao lưu."))
+        self.refresh()
+
+    def download_backup(self, item):
+        if not self._can_use_backup_permission("backup.view"):
+            self._show_info("Tải bản sao lưu", "Bạn không có quyền tải bản sao lưu.")
+            return
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Chọn thư mục lưu bản sao")
+        if not folder:
+            return
+        backup_path = Path(_as_text(item.get("storage_path") or ""))
+        if not backup_path.exists() or not backup_path.is_file():
+            self._show_info("Tải bản sao lưu", "Không tìm thấy tệp bản sao lưu trên máy chủ.")
+            return
+        destination = Path(folder) / backup_path.name
+        shutil.copy2(backup_path, destination)
+        self._show_info("Tải bản sao lưu", f"Đã sao chép tới:\n{destination}")
+
+    def delete_backup(self, item):
+        if not self._can_use_backup_permission("backup.delete") and not self._can_use_backup_permission("backup.execute"):
+            self._show_info("Xóa bản sao lưu", "Bạn không có quyền xóa bản sao lưu.")
+            return
+        backup_id = _as_text(item.get("backup_id"))
+        backup_path = Path(_as_text(item.get("storage_path") or ""))
+        file_name = backup_path.name if backup_path.name else backup_id
+        if not self._confirm("Xóa backup", f"Xóa bản sao lưu {file_name}? Thao tác này không thể hoàn tác."):
+            return
+        ok, message = SettingsController.delete_backup_record(backup_id)
+        self._show_info("Xóa bản sao lưu", message)
+        if ok and self.selected_backup_id == backup_id:
+            self.selected_backup_id = None
+        self.refresh()
+
+    def open_advanced_options(self):
+        settings = (self._last_summary or {}).get("settings") or {}
+        fields = [
+            {
+                "key": "storage_location",
+                "label": "Vị trí lưu trữ",
+                "type": "combo",
+                "options": [("Máy chủ nội bộ", "Máy chủ nội bộ"), ("Cloud storage", "Cloud storage")],
+            },
+            {"key": "storage_path", "label": "Đường dẫn lưu trữ"},
+            {"key": "retention_days", "label": "Số ngày lưu trữ", "type": "spin", "min": 1, "max": 365},
+            {
+                "key": "schedule_frequency",
+                "label": "Chu kỳ sao lưu",
+                "type": "combo",
+                "options": [("Hàng ngày", "daily"), ("Hàng tuần", "weekly"), ("Hàng tháng", "monthly")],
+            },
+            {"key": "schedule_time", "label": "Giờ sao lưu (HH:MM)"},
+        ]
+        dialog = FormDialog("Tùy chọn sao lưu nâng cao", fields, data=settings, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        user_id = self.user_data.get("user_id")
+        payload = dialog.values()
+        ok, message = SettingsController.update_backup_settings(user_id, payload)
+        self._show_info("Tùy chọn sao lưu", message)
+        if ok:
+            self.refresh()
+
+    def _toggle_backup_setting(self, key, state, label):
+        user_id = self.user_data.get("user_id")
+        if not user_id:
+            return
+
+        value = bool(state)
+        if key in {"auto_backup", "include_database"} and not value:
+            if not self._confirm("Xác nhận thay đổi", f"Tắt tùy chọn '{label}' có thể làm tăng rủi ro mất dữ liệu. Bạn có chắc muốn tiếp tục?"):
+                self.refresh()
+                return
+
+        ok, message = SettingsController.update_backup_settings(user_id, {key: value})
+        if not ok:
+            self._show_info("Cập nhật tùy chọn", message)
+        self.refresh()
+
+    def open_restore_picker(self):
+        items = self._last_items or []
+        if not items:
+            self._show_info("Khôi phục dữ liệu", "Chưa có bản sao lưu để khôi phục.")
+            return
+        options = []
+        mapping = {}
+        for item in items:
+            if _as_text(item.get("status")).lower().strip() != "success":
+                continue
+            backup_id = _as_text(item.get("backup_id"))
+            created_at = _format_datetime(item.get("created_at"))
+            size_text = self._backup_size_text(_as_int(item.get("size_bytes")))
+            text = f"{backup_id} • {created_at} • {size_text}"
+            options.append(text)
+            mapping[text] = backup_id
+
+        if not options:
+            self._show_info("Khôi phục dữ liệu", "Không có bản sao lưu thành công để chọn.")
+            return
+        selected, accepted = QtWidgets.QInputDialog.getItem(
+            self,
+            "Chọn bản sao lưu",
+            "Chọn bản sao lưu để khôi phục:",
+            options,
+            editable=False,
+        )
+        if not accepted:
+            return
+        self.selected_backup_id = mapping.get(selected)
+        self.refresh()
+
+    def select_backup_for_restore(self, item):
+        self.selected_backup_id = _as_text(item.get("backup_id"))
+        self.refresh()
+
+    def restore_selected_backup(self):
+        if not self._can_use_backup_permission("backup.restore"):
+            self._show_info("Khôi phục dữ liệu", "Bạn không có quyền khôi phục dữ liệu.")
+            return
+        user_id = self.user_data.get("user_id")
+        if not user_id:
+            self._show_info("Khôi phục dữ liệu", "Không xác định được tài khoản hiện tại.")
+            return
+        if not self.selected_backup_id:
+            self._show_info("Khôi phục dữ liệu", "Bạn chưa chọn bản sao lưu.")
+            return
+        if not self._confirm(
+            "Khôi phục dữ liệu",
+            "Khôi phục dữ liệu sẽ ghi đè cài đặt hiện tại của tài khoản này. Bạn có muốn tiếp tục?",
+        ):
+            return
+        ok, message = SettingsController.restore_from_backup(
+            user_id=user_id,
+            backup_id=self.selected_backup_id,
+            confirm_text="RESTORE",
+            create_backup_before_restore=True,
+        )
+        self._show_info("Khôi phục dữ liệu", message)
+        if ok:
+            self.selected_backup_id = None
+        self.refresh()
+
+
+    def _sync_doctor_filter(self):
+        current = self.doctor_combo.currentData() if hasattr(self, "doctor_combo") else "Tất cả"
+        doctors = _safe_fetch_all("SELECT name FROM Doctors WHERE is_active=1 ORDER BY name ASC")
+        self.doctor_combo.blockSignals(True)
+        self.doctor_combo.clear()
+        self.doctor_combo.addItem("Tất cả", "Tất cả")
+        for row in doctors:
+            name = _as_text(row.get("name")).strip()
+            if name:
+                self.doctor_combo.addItem(f"BS. {name}", name)
+        idx = self.doctor_combo.findData(current)
+        self.doctor_combo.setCurrentIndex(max(idx, 0))
+        self.doctor_combo.blockSignals(False)
+
+
+class AppointmentManagementView(AdminListPage):
+    page_title = "Quản lý lịch hẹn"
+    breadcrumb = "Dashboard / Quản lý lịch hẹn"
+    headers = ["ID", "Bệnh nhân", "Bác sĩ", "Ngày hẹn", "Trạng thái", "Thao tác"]
+    search_placeholder = "Tìm kiếm lịch hẹn..."
+
+    def _add_filters(self, layout):
+        self.status_filter = self._combo([
+            ("Tất cả trạng thái", "all"),
+            ("Chờ xác nhận", "pending"),
+            ("Đã xác nhận", "confirmed"),
+            ("Đang khám", "in_progress"),
+            ("Hoàn tất", "done"),
+            ("Đã hủy", "cancelled"),
+        ])
+        layout.addWidget(self.status_filter)
+
+    def load_rows(self):
+        return _safe_fetch_all(
+            """
+            SELECT a.*, p.name AS patient_name, d.name AS doctor_name
+            FROM Appointments a
+            LEFT JOIN Patients p ON p.patient_id = a.patient_id
+            LEFT JOIN Doctors d ON d.doctor_id = a.doctor_id
+            ORDER BY a.appointment_date DESC
+            """
+        )
+
+    def accept_row(self, row):
+        status_ok = self.status_filter.currentData() == "all" or row.get("status") == self.status_filter.currentData()
+        return status_ok and _contains(row, ["appointment_id", "patient_name", "doctor_name", "status"], self.search_input.text())
+
+    def stat_cards(self):
+        pending = sum(1 for row in self.rows if row.get("status") == "pending")
+        done = sum(1 for row in self.rows if row.get("status") == "done")
+        cancelled = sum(1 for row in self.rows if row.get("status") == "cancelled")
+        return [
+            self._stat_card("📅", "Tổng lịch hẹn", len(self.rows), "Tất cả trạng thái", "#2563eb"),
+            self._stat_card("⏳", "Chờ xác nhận", pending, "status = pending", "#f97316"),
+            self._stat_card("✅", "Hoàn tất", done, "status = done", "#00a651"),
+            self._stat_card("🚫", "Đã hủy", cancelled, "status = cancelled", "#ef4444"),
+        ]
+
+    def render_row(self, row, data):
+        self._set_item(row, 0, data.get("appointment_id"))
+        self._set_item(row, 1, data.get("patient_name") or f"BN #{data.get('patient_id')}")
+        self._set_item(row, 2, data.get("doctor_name") or f"BS #{data.get('doctor_id')}")
+        self._set_item(row, 3, _format_datetime(data.get("appointment_date")))
+        self.table.setCellWidget(row, 4, self._badge(_as_text(data.get("status"))))
+        cancel_btn = self._icon_button("Hủy", "danger")
+        cancel_btn.clicked.connect(lambda _, item=data: self.cancel_appointment(item))
+        self.table.setCellWidget(row, 5, self._action_cell([cancel_btn]))
+
+    def cancel_appointment(self, item):
+        if not self._confirm("Hủy lịch hẹn", "Chuyển lịch hẹn sang trạng thái cancelled?"):
+            return
+        ok = _safe_execute("UPDATE Appointments SET status='cancelled' WHERE appointment_id=?", (item.get("appointment_id"),))
+        self._show_info("Lịch hẹn", "Đã hủy lịch hẹn." if ok else "Không thể cập nhật lịch hẹn.")
+        self.refresh()
+
+    def export_row(self, row):
+        return [row.get("appointment_id"), row.get("patient_name"), row.get("doctor_name"), row.get("appointment_date"), row.get("status")]
+
+
+from views.service_management_view import ServiceManagementPage
+class CarePlusAdminDashboard(QtWidgets.QWidget):
+    MENU = [
+        ("🏠", "Dashboard", AdminHomePage),
+        ("👥", "Quản lý tài khoản", AccountManagementPage),
+        ("👨‍⚕️", "Quản lý bác sĩ", DoctorManagementPage),
+        ("🧑", "Quản lý bệnh nhân", PatientManagementPage),
+        ("💊", "Quản lý thuốc", MedicineManagementPage),
+        ("🧾", "Quản lý dịch vụ", ServiceManagementPage),
+        ("💳", "Quản lý thanh toán", PaymentManagementPage),
+        ("📊", "Xem báo cáo thống kê", ReportStatsPage),
+        ("🛡️", "Phân quyền hệ thống", RolePermissionPage),
+        ("💾", "Sao lưu dữ liệu", BackupManagementPage),
+    ]
+
+    def __init__(self, user_data=None, parent=None):
+        super().__init__(parent)
+        self.user_data = user_data or {"role": "admin"}
+        self.nav_buttons = []
+        _ensure_admin_runtime_schema()
+        self._build_shell()
+        self.switch_page(0)
+
+    def _build_shell(self):
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        sidebar = QtWidgets.QFrame()
+        sidebar.setFixedWidth(280)
+        sidebar.setStyleSheet("background: white; border-right: 1px solid #e2e8f0;")
+        side_layout = QtWidgets.QVBoxLayout(sidebar)
+        side_layout.setContentsMargins(16, 26, 16, 24)
+        side_layout.setSpacing(8)
+
+        logo = QtWidgets.QWidget()
+        logo_layout = QtWidgets.QHBoxLayout(logo)
+        logo_layout.setContentsMargins(6, 0, 0, 18)
+        logo_layout.setSpacing(10)
+        logo_icon = QtWidgets.QLabel("+")
+        logo_icon.setFixedSize(30, 30)
+        logo_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        logo_icon.setStyleSheet("background: #00a651; color: white; border-radius: 15px; font-size: 24px; font-weight: 950;")
+        logo_text = QtWidgets.QLabel("CarePlus Admin")
+        logo_text.setStyleSheet("color: #00a651; font-size: 22px; font-weight: 950; background: transparent;")
+        logo_layout.addWidget(logo_icon)
+        logo_layout.addWidget(logo_text)
+        logo_layout.addStretch()
+        side_layout.addWidget(logo)
+
+        for index, (icon, text, _) in enumerate(self.MENU):
+            btn = QtWidgets.QPushButton(f"  {icon}   {text}")
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+            btn.clicked.connect(lambda _, idx=index: self.switch_page(idx))
+            self.nav_buttons.append(btn)
+            side_layout.addWidget(btn)
+        side_layout.addStretch()
+        self.btn_logout = QtWidgets.QPushButton("  🚪   Đăng xuất")
+        self.btn_logout.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor))
+        self.btn_logout.setStyleSheet("""
+            QPushButton {
+                border: none;
+                text-align: left;
+                padding: 12px 14px;
+                color: #dc2626;
+                background: #fee2e2;
+                border-radius: 10px;
+                font-weight: 900;
+            }
+        """)
+        side_layout.addWidget(self.btn_logout)
+        root.addWidget(sidebar)
+
+        main = QtWidgets.QWidget()
+        main.setStyleSheet(f"background: {PAGE_BG};")
+        main_layout = QtWidgets.QVBoxLayout(main)
+        main_layout.setContentsMargins(24, 24, 24, 28)
+        main_layout.setSpacing(18)
+
+        header = QtWidgets.QHBoxLayout()
+        title_box = QtWidgets.QVBoxLayout()
+        title_box.setSpacing(3)
+        self.title_label = QtWidgets.QLabel()
+        self.title_label.setStyleSheet("font-size: 30px; color: #0f172a; font-weight: 950;")
+        self.breadcrumb_label = QtWidgets.QLabel()
+        self.breadcrumb_label.setStyleSheet("font-size: 13px; color: #64748b; font-weight: 700;")
+        title_box.addWidget(self.title_label)
+        title_box.addWidget(self.breadcrumb_label)
+        header.addLayout(title_box)
+        header.addStretch()
+        bell = QtWidgets.QFrame()
+        bell.setObjectName("adminBell")
+        bell.setFixedSize(44, 40)
+        bell.setStyleSheet("""
+            QFrame#adminBell {
+                background: white;
+                border: 1px solid #e2e8f0;
+                border-radius: 20px;
+            }
+        """)
+        bell_icon = QtWidgets.QLabel("🔔", bell)
+        bell_icon.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        bell_icon.setGeometry(8, 9, 28, 24)
+        bell_icon.setStyleSheet("background: transparent; color: #0f172a; font-size: 15px;")
+        bell_badge = QtWidgets.QLabel("3", bell)
+        bell_badge.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        bell_badge.setGeometry(27, 2, 16, 16)
+        bell_badge.setStyleSheet("background: #ef4444; color: white; border-radius: 8px; font-size: 10px; font-weight: 900;")
+        header.addWidget(bell)
+        user_name = self.user_data.get("name") or self.user_data.get("username") or "Quản trị viên"
+        user = QtWidgets.QFrame()
+        user.setObjectName("adminUserPill")
+        user.setStyleSheet("""
+            QFrame#adminUserPill {
+                background: white;
+                border: 1px solid #e2e8f0;
+                border-radius: 20px;
+            }
+            QLabel { background: transparent; }
+        """)
+        user_layout = QtWidgets.QHBoxLayout(user)
+        user_layout.setContentsMargins(7, 0, 13, 0)
+        user_layout.setSpacing(8)
+        avatar = QtWidgets.QLabel("👨‍💼")
+        avatar.setFixedSize(30, 30)
+        avatar.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        avatar.setStyleSheet("background: #eff6ff; border-radius: 15px; font-size: 17px;")
+        user_text = QtWidgets.QLabel(f"{user_name} (Quản trị viên) ▾")
+        user_text.setStyleSheet("color: #0f172a; font-weight: 850; font-size: 12px;")
+        user_layout.addWidget(avatar)
+        user_layout.addWidget(user_text)
+        user.setFixedHeight(40)
+        header.addWidget(user)
+        main_layout.addLayout(header)
+
+        self.stack = QtWidgets.QStackedWidget()
+        self.pages = []
+        for _, _, page_cls in self.MENU:
+            page = page_cls(self.user_data)
+            self.pages.append(page)
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            scroll.setWidget(page)
+            self.stack.addWidget(scroll)
+        main_layout.addWidget(self.stack)
+        root.addWidget(main)
+
+    def switch_page(self, index):
+        self.stack.setCurrentIndex(index)
+        page = self.pages[index]
+        self.title_label.setText(page.page_title)
+        self.breadcrumb_label.setText(page.breadcrumb)
+        for i, btn in enumerate(self.nav_buttons):
+            active = i == index
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    border: none;
+                    text-align: left;
+                    padding: 12px 14px;
+                    border-radius: 10px;
+                    font-size: 13px;
+                    color: {'#00a651' if active else '#1e293b'};
+                    background: {'#e8f7ef' if active else 'transparent'};
+                    font-weight: {'950' if active else '750'};
+                }}
+                QPushButton:hover {{ background: #f1f5f9; }}
+            """)
+
+
+PatientManagementView = PatientManagementPage
+DoctorManagementView = DoctorManagementPage
+MedicineManagementView = MedicineManagementPage
+ServiceManagementView = ServiceManagementPage
+PaymentManagementView = PaymentManagementPage
+ReportStatsView = ReportStatsPage
