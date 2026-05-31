@@ -173,9 +173,9 @@ python -m database.tools.mysql_migrate
 
 | Thành viên | Vai trò | Phạm vi phụ trách | Điểm đề xuất | Tỷ trọng |
 | --- | --- | --- | ---: | ---: |
-| Chu Ngọc Linh | Nhóm trưởng | Kiến trúc hệ thống, cấu hình, database, đăng nhập, phân quyền, điều hướng, quản trị, nghiệp vụ nhân viên, tích hợp và kiểm thử tổng thể | 5,5 | 55% |
-| Đinh Văn Dương | Thành viên | Module bác sĩ: lịch khám, khám bệnh, hồ sơ bệnh án, kê đơn thuốc và thông báo | 2,25 | 22,5% |
-| Bùi Đức Lâm | Thành viên | Module bệnh nhân: bác sĩ, dịch vụ, đặt lịch, lịch sử khám và hồ sơ cá nhân | 2,25 | 22,5% |
+| Chu Ngọc Linh | Nhóm trưởng | Kiến trúc hệ thống, cấu hình, database, đăng nhập, phân quyền, điều hướng, quản trị, nghiệp vụ nhân viên, tích hợp và kiểm thử tổng thể 
+| Đinh Văn Dương | Thành viên | Module bác sĩ: lịch khám, khám bệnh, hồ sơ bệnh án, kê đơn thuốc và thông báo 
+| Bùi Đức Lâm | Thành viên | Module bệnh nhân: bác sĩ, dịch vụ, đặt lịch, lịch sử khám và hồ sơ cá nhân 
 
 ## 10. Nguyên tắc bảo mật
 
