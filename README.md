@@ -51,7 +51,7 @@ BTL.Nhóm6_Python/
 
 | Thành phần | Công nghệ |
 | --- | --- |
-| Ngôn ngữ | Python 3.11+ |
+| Ngôn ngữ | Python 3.14+ |
 | Giao diện desktop | PyQt6 |
 | Database chính | SQL Server, `pyodbc` |
 | Database tương thích | MySQL 8.0, `mysql-connector-python` |
