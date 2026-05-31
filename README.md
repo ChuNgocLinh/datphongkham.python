@@ -171,8 +171,8 @@ python -m database.tools.mysql_migrate
 
 ## 9. Phân công nhóm
 
-| Thành viên | Vai trò | Phạm vi phụ trách | Điểm đề xuất | Tỷ trọng |
-| --- | --- | --- | ---: | ---: |
+| Thành viên | Vai trò | Phạm vi phụ trách 
+| --- | --- | --- 
 | Chu Ngọc Linh | Nhóm trưởng | Kiến trúc hệ thống, cấu hình, database, đăng nhập, phân quyền, điều hướng, quản trị, nghiệp vụ nhân viên, tích hợp và kiểm thử tổng thể 
 | Đinh Văn Dương | Thành viên | Module bác sĩ: lịch khám, khám bệnh, hồ sơ bệnh án, kê đơn thuốc và thông báo 
 | Bùi Đức Lâm | Thành viên | Module bệnh nhân: bác sĩ, dịch vụ, đặt lịch, lịch sử khám và hồ sơ cá nhân 
