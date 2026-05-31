@@ -1,0 +1,28 @@
+**/AGENT.md
+AGENTS.md
+.env
+.ENV
+venv/
+env/
+.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/*.pyc
+*$py.class
+
+# Backup files
+*.bak
+
+# IDEs
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Internal work artifacts
+/.sisyphus/
+/issue/

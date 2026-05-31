@@ -54,6 +54,7 @@ UI_CONFIG = {
 ROLES = {
     "ADMIN": "admin",
     "DOCTOR": "doctor",
+    "STAFF": "staff",
     "PATIENT": "patient"
 }
 
@@ -96,3 +97,14 @@ def get_connection_string():
 # 🧪 DEBUG CONFIG (optional)
 # ================================
 DEBUG = True
+
+# ================================
+# 📅 APPOINTMENT SLOT CONFIG
+# ================================
+DEFAULT_SLOTS = [
+    "08:00", "08:30", "09:00", "09:30", "10:00", "10:30", "11:00", "11:30",
+    "12:00", "12:30", "13:00", "13:30", "14:00", "14:30", "15:00", "15:30",
+    "16:00", "16:30", "17:00"
+]
+
+DEFAULT_QUEUE_AREA = "3B"

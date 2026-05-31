@@ -27,24 +27,21 @@ flowchart LR
 ```
 
 ```text
-BTL.Nhóm6_Python/
-|-- healthcare_management/
-|   |-- assets/                 # Tài nguyên giao diện
-|   |-- controllers/            # Xử lý nghiệp vụ
-|   |-- database/
-|   |   |-- scripts/
-|   |   |   |-- sqlserver/      # Script dành cho SQL Server
-|   |   |   `-- mysql/          # Script tương thích MySQL
-|   |   |-- tools/              # Công cụ bảo trì database
-|   |   |-- db.py               # Kết nối database
-|   |   |-- sql_utils.py        # Helper truy vấn đa hệ quản trị
-|   |   `-- view_db_helper.py   # Helper truy vấn an toàn cho giao diện
-|   |-- models/                 # Mô hình dữ liệu
-|   |-- views/                  # Giao diện theo vai trò
-|   |-- config.py               # Cấu hình ứng dụng
-|   `-- main.py                 # Điểm bắt đầu chương trình
-|-- tests/                      # Kiểm thử tự động
-`-- pytest.ini                  # Cấu hình pytest
+datphongkham.python/
+|-- assets/                     # Tài nguyên giao diện
+|-- controllers/                # Xử lý nghiệp vụ
+|-- database/
+|   |-- scripts/
+|   |   `-- sqlserver/          # Script dành cho SQL Server
+|   |-- db.py                   # Kết nối database
+|   |-- sql_utils.py            # Helper truy vấn đa hệ quản trị
+|   `-- view_db_helper.py       # Helper truy vấn an toàn cho giao diện
+|-- models/                     # Mô hình dữ liệu
+|-- views/                      # Giao diện theo vai trò
+|-- .env.example                # Mẫu cấu hình môi trường
+|-- config.py                   # Cấu hình ứng dụng
+|-- main.py                     # Điểm bắt đầu chương trình
+`-- requirements.txt            # Thư viện Python cần cài đặt
 ```
 
 ## 3. Công nghệ sử dụng
@@ -54,40 +51,28 @@ BTL.Nhóm6_Python/
 | Ngôn ngữ | Python 3.14+ |
 | Giao diện desktop | PyQt6 |
 | Database chính | SQL Server, `pyodbc` |
-| Database tương thích | MySQL 8.0, `mysql-connector-python` |
 | Cấu hình môi trường | `python-dotenv` |
-| Kiểm thử | `pytest`, `pytest-qt` |
 
-## 4. Cài đặt
+## 4. Cài đặt và chạy chương trình
 
 ### 4.1. Yêu cầu hệ thống
 
-- Python 3.11 trở lên
+- Python 3.14 trở lên
 - SQL Server
 - ODBC Driver 17 for SQL Server
 - Git
 
-### 4.2. Tạo môi trường Python
+### 4.2. Cài đặt thư viện
 
-Tại thư mục gốc của repo, chạy:
-
-```bash
-python -m venv .venv
-```
-
-Kích hoạt môi trường ảo trên Windows:
+Tại thư mục gốc của repo:
 
 ```powershell
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Cài đặt thư viện:
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 4.3. Cấu hình kết nối SQL Server
+### 4.3. Cấu hình SQL Server
 
 Tạo file `.env` từ file mẫu:
 
@@ -111,7 +96,7 @@ File `.env` chỉ dùng trên máy cá nhân và không được đưa lên GitH
 Các script SQL Server nằm tại:
 
 ```text
-BTL.Nhóm6_Python/healthcare_management/database/scripts/sqlserver/
+database/scripts/sqlserver/
 ```
 
 Thứ tự sử dụng:
@@ -122,18 +107,13 @@ Thứ tự sử dụng:
 
 > Lưu ý: `seed_sqlserver.sql` xóa dữ liệu nghiệp vụ hiện có trước khi thêm dữ liệu demo. Chỉ chạy script này khi chủ động đặt lại dữ liệu.
 
-Hướng dẫn bổ sung nằm trong [`database/scripts/README.md`](BTL.Nhóm6_Python/healthcare_management/database/scripts/README.md).
+### 4.5. Khởi động ứng dụng
 
-## 5. Chạy ứng dụng
-
-Tại thư mục gốc của repo:
-
-```bash
-cd BTL.Nhóm6_Python/healthcare_management
+```powershell
 python main.py
 ```
 
-## 6. Tài khoản demo
+## 5. Tài khoản demo
 
 Sau khi nạp dữ liệu mẫu, có thể đăng nhập bằng các tài khoản sau. Mật khẩu mặc định dùng chung là `123456`.
 
@@ -146,39 +126,16 @@ Sau khi nạp dữ liệu mẫu, có thể đăng nhập bằng các tài khoả
 
 Các tài khoản trên chỉ phục vụ mục đích trình diễn và kiểm thử.
 
-## 7. Chạy kiểm thử
+## 6. Phân công nhóm
 
-Tại thư mục gốc của repo:
+| Thành viên | Vai trò | Phạm vi phụ trách |
+| --- | --- | --- |
+| Chu Ngọc Linh | Nhóm trưởng | Kiến trúc hệ thống, cấu hình, database, đăng nhập, phân quyền, điều hướng, quản trị, nghiệp vụ nhân viên, tích hợp và kiểm thử tổng thể |
+| Đinh Văn Dương | Thành viên | Module bác sĩ: khám bệnh, hồ sơ bệnh án và kê đơn thuốc |
+| Bùi Đức Lâm | Thành viên | Module bệnh nhân: bác sĩ, dịch vụ, đặt lịch, lịch sử khám, hồ sơ cá nhân và thông báo |
 
-```bash
-python -m pytest -q BTL.Nhóm6_Python/tests
-```
+## 7. Nguyên tắc bảo mật
 
-Bộ kiểm thử tập trung vào phân quyền, lịch hẹn, luồng nghiệp vụ bác sĩ, hồ sơ bệnh nhân, đơn thuốc, thông báo và các lỗi hồi quy quan trọng.
-
-## 8. Tương thích MySQL
-
-Repo vẫn giữ `docker-compose.yml`, script MySQL và công cụ migration để hỗ trợ môi trường cũ. Cấu hình chính dùng để trình bày bài tập lớn là SQL Server.
-
-Các công cụ bảo trì database có thể chạy từ thư mục `BTL.Nhóm6_Python/healthcare_management`:
-
-```bash
-python -m database.tools.hash_passwords
-python -m database.tools.mysql_migrate
-```
-
-`mysql_migrate` chỉ sử dụng khi chạy cấu hình MySQL.
-
-## 9. Phân công nhóm
-
-| Thành viên | Vai trò | Phạm vi phụ trách 
-| --- | --- | --- 
-| Chu Ngọc Linh | Nhóm trưởng | Kiến trúc hệ thống, cấu hình, database, đăng nhập, phân quyền, điều hướng, quản trị, nghiệp vụ nhân viên, tích hợp và kiểm thử tổng thể 
-| Đinh Văn Dương | Thành viên | Module bác sĩ: lịch khám, khám bệnh, hồ sơ bệnh án, kê đơn thuốc và thông báo 
-| Bùi Đức Lâm | Thành viên | Module bệnh nhân: bác sĩ, dịch vụ, đặt lịch, lịch sử khám và hồ sơ cá nhân 
-
-## 10. Nguyên tắc bảo mật
-
-- Không commit file `.env`, mật khẩu cá nhân hoặc thông tin kết nối nội bộ.
+- Không commit file `.env`, `.ENV`, mật khẩu cá nhân hoặc thông tin kết nối nội bộ.
 - Không sử dụng tài khoản demo trong môi trường thật.
 - Chỉ chạy script seed khi đã xác nhận có thể đặt lại dữ liệu.

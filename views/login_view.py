@@ -1,15 +1,40 @@
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QLineEdit, QPushButton,
-    QHBoxLayout, QVBoxLayout, QMessageBox, QFrame, 
+    QHBoxLayout, QVBoxLayout, QMessageBox, QFrame,
     QStackedWidget, QCheckBox, QGridLayout
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QPixmap, QFont, QCursor
+from PyQt6.QtCore import Qt, QSize, QRectF
+from PyQt6.QtGui import QPixmap, QFont, QCursor, QPainter, QPainterPath
+from pathlib import Path
 
 from controllers.auth_controller import AuthController
 from views.main_view import MainView
 
 class LoginView(QWidget):
+    @staticmethod
+    def _rounded_background_pixmap(pixmap, width, height, radius):
+        scaled = pixmap.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        x = max(0, (scaled.width() - width) // 2)
+        y = max(0, (scaled.height() - height) // 2)
+        cropped = scaled.copy(x, y, width, height)
+
+        rounded = QPixmap(width, height)
+        rounded.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(rounded)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0, 0, width, height), radius, radius)
+        painter.setClipPath(path)
+        painter.drawPixmap(0, 0, cropped)
+        painter.end()
+        return rounded
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CarePlus - Healthcare Management System")
@@ -17,7 +42,7 @@ class LoginView(QWidget):
         self.setStyleSheet("background-color: #f4f9ff;")
 
         window_layout = QVBoxLayout(self)
-        
+
         self.main_card = QFrame()
         self.main_card.setFixedSize(1050, 720)
         self.main_card.setStyleSheet("background-color: white; border-radius: 30px;")
@@ -29,13 +54,13 @@ class LoginView(QWidget):
 
         # ================= LEFT PANEL =================
         left_panel = QFrame()
-        left_panel.setFixedWidth(520)
+        left_panel.setFixedSize(520, 720)
+        left_panel.setObjectName("leftHeroPanel")
 
         left_panel.setStyleSheet("""
-            QFrame {
-                border-top-left-radius: 30px;
-                border-bottom-left-radius: 30px;
-                background-color: black;
+            #leftHeroPanel {
+                border-radius: 30px;
+                background-color: transparent;
             }
         """)
 
@@ -43,18 +68,12 @@ class LoginView(QWidget):
         bg_label = QLabel(left_panel)
         bg_label.setGeometry(0, 0, 520, 720)
 
-        pixmap = QPixmap("healthcare_management/assets/bg.jpg")
+        bg_path = Path(__file__).resolve().parents[1] / "assets" / "bg.jpg"
+        pixmap = QPixmap(str(bg_path))
+        if not pixmap.isNull():
+            bg_label.setPixmap(self._rounded_background_pixmap(pixmap, 520, 720, 30))
 
-        bg_label.setPixmap(
-            pixmap.scaled(
-                520,
-                720,
-                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                Qt.TransformationMode.SmoothTransformation
-            )
-        )
-
-        bg_label.setScaledContents(True)
+        bg_label.setScaledContents(False)
 
         # ===== OVERLAY TỐI NHẸ =====
         overlay = QFrame(left_panel)
@@ -62,8 +81,7 @@ class LoginView(QWidget):
 
         overlay.setStyleSheet("""
             background-color: rgba(0, 0, 0, 90);
-            border-top-left-radius: 30px;
-            border-bottom-left-radius: 30px;
+            border-radius: 30px;
         """)
 
         # ===== ĐƯA ẢNH RA SAU =====
@@ -83,13 +101,17 @@ class LoginView(QWidget):
             background: transparent;
         """)
         left_layout.addWidget(header_logo)
-        
+
         left_layout.addSpacing(20)
 
         # Tiêu đề chính
-        title_large = QLabel("Chăm sóc sức khỏe\ndễ dàng hơn mỗi ngày")
+        title_large = QLabel("Chăm sóc sức khỏe\ndễ dàng hơn\nmỗi ngày")
+        title_large.setFixedWidth(440)
+        title_large.setMinimumHeight(165)
+        title_large.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        title_large.setWordWrap(True)
         title_large.setStyleSheet("""
-            font-size: 44px;
+            font-size: 42px;
             font-weight: 900;
             color: white;
             line-height: 1.2;
@@ -119,7 +141,7 @@ class LoginView(QWidget):
         banner_layout = QHBoxLayout(banner_frame)
         banner_layout.setContentsMargins(10, 10, 10, 10)
         banner_layout.setSpacing(5)
-        
+
         features = [
             ("🛡️", "An toàn", "Bảo mật thông tin\ntuyệt đối"),
             ("🕒", "Nhanh chóng", "Đặt lịch chỉ trong\nvài bước"),
@@ -132,17 +154,17 @@ class LoginView(QWidget):
             f_icon = QLabel(icon)
             f_icon.setStyleSheet("font-size: 20px; background: transparent;")
             f_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
+
             f_title = QLabel(title)
             f_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #1a2d42; background: transparent;")
             f_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
+
             f_desc = QLabel(desc)
             f_desc.setWordWrap(True)
             f_desc.setFixedWidth(100)
             f_desc.setStyleSheet("font-size: 10px; color: #666; background: transparent;")
             f_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            
+
             f_item.addWidget(f_icon)
             f_item.addWidget(f_title)
             f_item.addWidget(f_desc)
@@ -174,7 +196,7 @@ class LoginView(QWidget):
         tab_layout = QHBoxLayout()
         btn_tab_login = QPushButton("👤 Đăng nhập")
         btn_tab_login.setStyleSheet("font-weight: bold; color: #006fe6; border: none; border-bottom: 3px solid #006fe6; padding: 10px; font-size: 16px;")
-        
+
         btn_tab_reg = QPushButton("👤+ Đăng ký")
         btn_tab_reg.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         btn_tab_reg.setStyleSheet("color: #888; border: none; padding: 10px; font-size: 16px;")
@@ -196,7 +218,7 @@ class LoginView(QWidget):
         self.username = QLineEdit()
         self.username.setPlaceholderText("Email hoặc số điện thoại")
         self.username.setStyleSheet(self.get_input_style())
-        
+
         self.password = QLineEdit()
         self.password.setPlaceholderText("Mật khẩu")
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -213,7 +235,7 @@ class LoginView(QWidget):
             QCheckBox::indicator:unchecked { border: 2px solid #ddd; border-radius: 4px; background: white; }
             QCheckBox::indicator:checked { border: 2px solid #006fe6; border-radius: 4px; background: #006fe6; }
         """)
-        
+
         forgot_btn = QPushButton("Quên mật khẩu?")
         forgot_btn.setStyleSheet("color: #006fe6; border: none; font-size: 13px; font-weight: bold;")
         forgot_btn.clicked.connect(lambda: self.right_stack.setCurrentIndex(2))
@@ -245,7 +267,7 @@ class LoginView(QWidget):
         title = QLabel("Tạo tài khoản mới 📝")
         title.setStyleSheet("font-size: 28px; font-weight: bold; color: #000;")
         layout.addWidget(title)
-        
+
         desc = QLabel("Tham gia cùng cộng đồng CarePlus ngay hôm nay")
         desc.setStyleSheet("color: #555; font-size: 14px; margin-bottom: 10px;")
         layout.addWidget(desc)
@@ -277,23 +299,23 @@ class LoginView(QWidget):
         email = self.reg_inputs["Email cá nhân"].text().strip()
         pwd = self.reg_inputs["Mật khẩu"].text().strip()
         pwd_conf = self.reg_inputs["Xác nhận mật khẩu"].text().strip()
-        
+
         if not all([name, phone, email, pwd, pwd_conf]):
             msg = QMessageBox(self)
             msg.setText("Vui lòng điền đầy đủ thông tin!")
             msg.setStyleSheet("QLabel{ color: #000; }")
             msg.exec()
             return
-            
+
         if pwd != pwd_conf:
             msg = QMessageBox(self)
             msg.setText("Mật khẩu xác nhận không khớp!")
             msg.setStyleSheet("QLabel{ color: #000; }")
             msg.exec()
             return
-            
+
         res = AuthController.register(email, pwd, name, phone, email)
-        
+
         msg = QMessageBox(self)
         msg.setWindowTitle("Thông báo")
         msg.setText(res["message"])
@@ -310,11 +332,11 @@ class LoginView(QWidget):
         layout = QVBoxLayout(self.forgot_page)
         layout.setContentsMargins(50, 80, 50, 80)
         layout.setSpacing(20)
-        
+
         lbl = QLabel("Khôi phục mật khẩu 🔑")
         lbl.setStyleSheet("font-size: 24px; font-weight: bold; color: #000;")
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        
+
         sub = QLabel("Nhập email để nhận mã khôi phục")
         sub.setStyleSheet("color: #555; font-size: 14px;")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -322,10 +344,10 @@ class LoginView(QWidget):
         email_forgot = QLineEdit()
         email_forgot.setPlaceholderText("Email của bạn...")
         email_forgot.setStyleSheet(self.get_input_style())
-        
+
         send_btn = QPushButton("Gửi yêu cầu")
         send_btn.setStyleSheet(self.get_main_btn_style())
-        
+
         back_btn = QPushButton("Quay lại")
         back_btn.clicked.connect(lambda: self.right_stack.setCurrentIndex(0))
         back_btn.setStyleSheet("border: none; color: #888; font-weight: bold;")
@@ -364,11 +386,12 @@ class LoginView(QWidget):
             msg.setStyleSheet("QLabel{ color: #000; }")
             msg.exec()
             return
-            
+
         res = AuthController.login(user, pwd)
         if res and res.get("status"):
             user_data = res.get("user")
-            self.main_window = MainView(res.get("role"), user_data, self)
+            role = str(res.get("role") or "").lower().strip()
+            self.main_window = MainView(role, user_data, self)
             self.main_window.show()
             self.close()
         else:

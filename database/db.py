@@ -50,7 +50,7 @@ def fetch_all(query, params=()):
         # MySQL dùng %s, SQL Server dùng ?
         formatted_query = query.replace('?', '%s') if DB_TYPE == "mysql" else query
         cursor.execute(formatted_query, params)
-        
+
         # MySQL connector trả về cursor.description khác với pyodbc
         columns = [col[0] for col in cursor.description]
         result = [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -70,7 +70,7 @@ def fetch_one(query, params=()):
     try:
         formatted_query = query.replace('?', '%s') if DB_TYPE == "mysql" else query
         cursor.execute(formatted_query, params)
-        
+
         row = cursor.fetchone()
         if row:
             columns = [col[0] for col in cursor.description]
